@@ -124,6 +124,9 @@ Config makeE2eConfig(const std::wstring& rulePath, uint16_t socksPort,
     c.relay.port = relayPort;
     c.routing.bypassPrivate = false;   // targets are the LAN address
     c.routing.blockUdpForRules = false;
+    // The copied bystander shares this fixture's directory. These phases
+    // test exact executable rules; directory coverage has its own unit tests.
+    c.routing.coverAppDirAlways = false;
     c.proxy.healthIntervalS = 30;      // keep health quiet
     c.nodeMonitor.enabled = false;    // do not probe the mock HTTP listener
     c.proxy.clashApi.host.clear();
@@ -256,7 +259,6 @@ int main() {
 
     // ---- phase 4: fail-open when the proxy dies ---------------------------------
     {
-        MockSocks5Server deadSocks;  // never started
         EngineEvents ev;
         std::mutex mu;
         std::string lastStatus;
@@ -266,7 +268,7 @@ int main() {
         };
         Engine engine(makeWinDivertDevice(), std::move(ev));
         isolateBackgroundWork(engine);
-        Config cfg = makeE2eConfig(targetExe, 1 /* dead port */, relayPort);
+        Config cfg = makeE2eConfig(targetExe, socks.port(), relayPort);
         cfg.proxy.healthIntervalS = 1;
         cfg.proxy.healthTimeoutMs = 500;
         cfg.proxy.healthFailThreshold = 1;
@@ -275,6 +277,9 @@ int main() {
             std::printf("FAIL: engine start: %s\n", err.c_str());
             return 1;
         }
+        // Kill the previously working endpoint after startup, matching the
+        // scenario under test without relying on an unowned fixed port.
+        socks.stop();
         bool degraded = false;
         for (int i = 0; i < 160; ++i) {
             {

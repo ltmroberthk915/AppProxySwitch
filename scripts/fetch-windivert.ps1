@@ -48,8 +48,22 @@ if ($actual -ne $Sha256) {
 Write-Host "SHA-256 verified: $actual"
 
 # ---- extract & normalize layout ----------------------------------------------
+function Remove-ExtractionDirectory {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $resolved = (Resolve-Path -LiteralPath $Path).ProviderPath
+    $allowed = [IO.Path]::GetFullPath((Join-Path $destDir '_extract'))
+    if (-not [string]::Equals($resolved, $allowed, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to remove an unexpected extraction directory.'
+    }
+    if ((Get-Item -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw 'Refusing to remove an extraction directory link.'
+    }
+    Remove-Item -LiteralPath $resolved -Recurse -Force
+}
+
 $tmp = Join-Path $destDir '_extract'
-if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+Remove-ExtractionDirectory $tmp
 Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 
 $src = Get-ChildItem -Path $tmp -Recurse -Filter 'WinDivert64.sys' |
@@ -62,7 +76,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $destDir 'include') | Out-N
 New-Item -ItemType Directory -Force -Path (Join-Path $destDir 'bin\x64')  | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $destDir 'lib\x64')  | Out-Null
 
-$pkgRoot = Split-Path -Parent (Split-Path -Parent $binDir)
+$pkgRoot = Split-Path -Parent $binDir
 Copy-Item (Join-Path $pkgRoot 'include\windivert.h') (Join-Path $destDir 'include\windivert.h') -Force
 Copy-Item (Join-Path $binDir 'WinDivert.dll')    (Join-Path $destDir 'bin\x64\WinDivert.dll')    -Force
 Copy-Item (Join-Path $binDir 'WinDivert64.sys')  (Join-Path $destDir 'bin\x64\WinDivert64.sys')  -Force
@@ -76,5 +90,5 @@ if ($licSrc) {
 }
 
 Set-Content -Path (Join-Path $destDir 'VERSION.txt') -Value "WinDivert $Version (official release, SHA-256 verified: $actual)"
-Remove-Item -Recurse -Force $tmp
+Remove-ExtractionDirectory $tmp
 Write-Host "WinDivert $Version ready under third_party\windivert"

@@ -4,8 +4,7 @@
   "configurePresets": [
     {
       "name": "debug",
-      "displayName": "Debug x64 (VS2022)",
-      "generator": "Visual Studio 17 2022",
+      "displayName": "Debug x64 (MSVC)",
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build/debug",
       "cacheVariables": {
@@ -14,8 +13,7 @@
     },
     {
       "name": "release",
-      "displayName": "Release x64 (VS2022)",
-      "generator": "Visual Studio 17 2022",
+      "displayName": "Release x64 (MSVC)",
       "architecture": "x64",
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {

@@ -1110,10 +1110,18 @@ APS_TEST(engine, dns_controller_re_picks_after_kernel_dies) {
     api2.dnsAnswers["x.com"] = {"5.6.7.8"};
     EXPECT_TRUE(api2.start());
 
+    // Reserve the SOCKS endpoints and reject CONNECT deterministically.
+    // Unowned fixed ports can consume the resolver budget on hosted runners.
+    MockSocks5Server socks1, socks2;
+    socks1.setBehavior(MockSocksBehavior::RefuseConnect);
+    socks2.setBehavior(MockSocksBehavior::RefuseConnect);
+    EXPECT_TRUE(socks1.start());
+    EXPECT_TRUE(socks2.start());
+
     Harness h;
     auto scripted = std::make_shared<std::vector<DiscoveredKernel>>();
-    scripted->push_back(makeKernel("kern-a.exe", 7001, api1.port()));
-    scripted->push_back(makeKernel("kern-b.exe", 7002, api2.port()));
+    scripted->push_back(makeKernel("kern-a.exe", socks1.port(), api1.port()));
+    scripted->push_back(makeKernel("kern-b.exe", socks2.port(), api2.port()));
     h.discoveryScan = [scripted](DiscoveryMode) { return *scripted; };
     h.cacheLoader = [] { return std::vector<DiscoveredKernel>{}; };
     Config c = h.makeConfig();
@@ -1122,9 +1130,12 @@ APS_TEST(engine, dns_controller_re_picks_after_kernel_dies) {
     c.proxy.clashApi.port = 0;
     c.proxy.healthIntervalS = 30;
     c.nodeMonitor.enabled = false;
-    h.start(c, /*discoveryEnabled=*/true);
+    // Scripted scans are synchronous so mutating the vector cannot race a
+    // background scan, and the controller is installed before the query.
+    h.start(c);
+    h.engine->setDnsSocksDnsServerForTest({0x7F000001, 1});
     h.engine->setDnsTtlMsForTest(120);  // fresh for ~120ms
-    Sleep(250);  // let the pump's initial adoption install the kernels
+    h.engine->adoptDiscoveries();
 
     const uint32_t kDns = 0x72727272;  // 114.114.114.114
     auto query = dnsQueryBytes("x.com");
@@ -1212,7 +1223,7 @@ APS_TEST(engine, dns_falls_back_to_socks_tcp_for_kernels_without_query_api) {
 APS_TEST(engine, dns_prefers_socks_tunnel_over_poisoned_controller) {
     // THE 2026-08-28 incident in test form: the kernel's controller answers
     // with well-formed but POISONED records (a mode: direct kernel resolves
-    // through GFW-poisoned upstreams — no client-side check can tell the
+    // through rewritten upstreams — no client-side check can tell the
     // answer apart from a real one). The SOCKS TCP-53 path through the
     // kernel's tunnel must be the PRIMARY resolver: the nameserver sees the
     // node's exit, so its answer is clean by construction.
@@ -1416,7 +1427,7 @@ APS_TEST(engine, node_switch_flushes_dns_cache) {
 APS_TEST(engine, configured_dns_servers_are_tried_before_detected) {
     // User-configured servers (data) come first: the auto-detected ones
     // come from the kernel configs and are often CHINA-hosted — their
-    // answers cross the GFW on the way back and arrive poisoned even
+    // answers cross the network intermediaries on the way back and arrive poisoned even
     // through an otherwise clean node (measured 2026-08-31). No seam
     // override here: the configured server is the ONLY usable one (the
     // kernel has no config.yaml and the adapter DNS is private-filtered).
@@ -1470,7 +1481,7 @@ APS_TEST(engine, configured_dns_servers_are_tried_before_detected) {
 
 APS_TEST(engine, doh_resolver_is_preferred_over_plain_53) {
     // The 17:33 incident: plain TCP-53 answers get swapped wherever the
-    // return path crosses the GFW — well-formed Facebook IPs came back
+    // return path passes through network intermediaries — well-formed Facebook IPs came back
     // from 8.8.8.8 itself through a transit node, and were cached as
     // "clean". DoH (encrypted HTTPS body) is the primary resolver now;
     // plain-53 is the fallback when DoH cannot run.
@@ -3823,7 +3834,7 @@ APS_TEST(engine, verify_failed_nodes_are_cooled_down_and_chain_settles) {
 }
 
 APS_TEST(engine, poisoned_destination_failures_do_not_churn_nodes) {
-    // The 2026-08-31 incident: the app (browser) held GFW-poisoned answers —
+    // The 2026-08-31 incident: the app (browser) held rewritten answers —
     // REAL Facebook/Twitter IPs — and every connection to them failed or
     // "succeeded" meaninglessly. Counting those failures against the NODE
     // re-selected a healthy kernel in a loop. Failures to destinations WE
@@ -4241,7 +4252,10 @@ APS_TEST(engine, inactive_kernel_status_is_bound_to_its_own_proxy_port) {
     c.nodeMonitor.enabled = true; c.nodeMonitor.intervalS = 600;
     c.proxy.clashApi.host.clear();
     c.nodeMonitor.regions.clear(); c.nodeMonitor.nodeClasses.clear();
-    h.start(c, true);
+    // A published discovery row can precede the rebuilt egress table. Finish
+    // adoption synchronously before checking this outlet's enabled state.
+    h.start(c);
+    h.engine->adoptDiscoveries();
     EXPECT_TRUE(h.waitStatus([](const std::string& s) {
         return s.find("auto-inactive-core.exe") != std::string::npos;
     }, 5000));

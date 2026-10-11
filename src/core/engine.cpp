@@ -1824,7 +1824,7 @@ void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
             }
             // UNTRUSTED failure (destination not from our clean answers and
             // the kernel port is alive): the app is holding a stale or
-            // GFW-poisoned answer — poison IPs are REAL Facebook/Twitter
+            // rewritten answer — poison IPs are REAL Facebook/Twitter
             // addresses, so their connect outcomes say nothing about node
             // quality. Counting them blamed healthy nodes and churned the
             // kernel in a loop (measured 2026-08-31). The actual fix — the
@@ -1929,7 +1929,7 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
     }
     if (!trusted) {
         // The app is holding an answer we never handed out (stale or
-        // GFW-poisoned — those are REAL IPs of other blocked services, so a
+        // rewritten — those are real IPs of unrelated services, so a
         // successful CONNECT to them proves nothing). No node choice can
         // fix a bad destination: neither confirm nor punish. Recovery is
         // the app re-resolving; our clean answers then take over.
@@ -2740,7 +2740,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
         st.latencyMs = chosen->latency;
         // The DNS resolution path changed with the node: cached answers may
         // have come back POISONED through the previous node's path (measured
-        // 2026-08-31: a 中转 node's return path crosses the GFW, which
+        // 2026-08-31: a 中转 node's return path passes through network intermediaries, which
         // injects fake records into TCP-53 responses — the resolver cached
         // 69.171.235.22 for www.youtube.com). Flush so the next query
         // re-resolves through the NEW node immediately.
@@ -3171,7 +3171,7 @@ bool Engine::resolveViaSocksTcpDns(const std::string& name,
         }
     }
     // User-configured servers first (data, not code): plain DNS to a
-    // CHINA-hosted server from an overseas exit crosses the GFW on the way
+    // remote DNS resolver from an different network outlet passes through network intermediaries on the way
     // back and comes back with well-formed fake records (measured
     // 2026-08-31: 223.5.5.5 through an IPLC node still answered youtube
     // with Facebook IPs; 8.8.8.8 through the same node was clean). The
@@ -3186,7 +3186,7 @@ bool Engine::resolveViaSocksTcpDns(const std::string& name,
     for (const auto& [kid, socksPort] : cands) {
         // DoH FIRST, via this kernel's HTTP-CONNECT (mixed) port: plain
         // TCP-53 answers get swapped wherever the return path crosses the
-        // GFW — even from 8.8.8.8, through transit nodes (measured
+        // network intermediaries — even from 8.8.8.8, through transit nodes (measured
         // 2026-08-31 17:33: youtube answered 69.171.235.22, a Facebook IP,
         // through the resolver's plain-53 path; the encrypted HTTPS body
         // cannot be injected). Only the USER-CONFIGURED servers are used as

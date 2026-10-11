@@ -1,7 +1,7 @@
 // DNS-over-HTTPS resolver dialed through a local HTTP CONNECT proxy (a
 // Clash kernel's mixed-port). First-principles anti-poisoning: plain
 // TCP-53 answers can be swapped mid-flight wherever the return path
-// crosses the GFW (measured repeatedly 2026-08-28..31: well-formed fake
+// passes through network intermediaries (measured repeatedly 2026-08-28..31: well-formed fake
 // Facebook/Twitter IPs returned through transit nodes even when querying
 // 8.8.8.8); an HTTPS body cannot be injected. The DoH endpoint set comes
 // from the user's routing.dns_servers config — Google (8.8.8.8) and

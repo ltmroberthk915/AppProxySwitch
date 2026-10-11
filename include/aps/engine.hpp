@@ -483,7 +483,7 @@ private:
         int64_t lastFailMs = 0;
         int64_t lastAutoRoundMs = 0;  // gates self-triggered rounds
         // Whether lastFailIp was in OUR injected-clean DNS cache at failure
-        // time. GFW poison answers are REAL IPs of other blocked services
+        // time. Rewritten DNS answers are real IPs of unrelated services
         // (Facebook/Twitter): a CONNECT to them SUCCEEDS through any working
         // node, so an un-trusted target's success must never read as "node
         // confirmed" (measured 14:58:45: verification to 31.13.92.37 — a

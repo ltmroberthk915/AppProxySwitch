@@ -103,7 +103,7 @@ struct RoutingSettings {
     bool blockIpv6ForRules = true;    // drop rule processes' IPv6 SYNs -> happy-eyeballs
                                       // falls back to IPv4, which we proxy
     // Anti-pollution DNS: rule processes' A queries are answered from the
-    // Clash controller's /dns/query (remote resolution) so GFW-poisoned
+    // Clash controller's /dns/query (remote resolution) so rewritten
     // answers never reach them.
     bool dnsCleanup = true;
     // Legacy machine-wide rewriting is opt-in. By default only queries
@@ -126,8 +126,8 @@ struct RoutingSettings {
     bool coverAppDirAlways = true;
     // Preferred DNS servers for the anti-pollution resolver, tried BEFORE
     // the auto-detected ones (the kernel configs' nameserver lists). Plain
-    // DNS from an overseas exit to a CHINA-hosted server (223.5.5.5 etc.)
-    // crosses the GFW on the way back and comes back poisoned with
+    // DNS from an different network outlet to a remote DNS resolver (223.5.5.5 etc.)
+    // passes through network intermediaries on the way back and comes back poisoned with
     // well-formed fake records (measured 2026-08-31); a FOREIGN server
     // (8.8.8.8 / 1.1.1.1) stays on the clean side of the border. Empty =
     // pure auto-detection (no assumptions in code — the value lives here,

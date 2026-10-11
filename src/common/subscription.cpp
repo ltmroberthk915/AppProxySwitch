@@ -615,7 +615,7 @@ std::string mergeIntoExisting(const std::string& sub, const std::string& existin
     // The kernel MUST run in rule mode: the kernel's OWN traffic (its DoH
     // upstream queries to alidns/doh.pub) falls through the rules and goes
     // through the node. In direct mode those queries fly out from China
-    // directly, get GFW-poisoned (youtube.com -> Twitter IPs measured
+    // directly, get rewritten (youtube.com -> Twitter IPs measured
     // 2026-08-28), and the kernel then serves poisoned answers to our DNS
     // cleanup and to every app. (SakuraCat's own GUI writes direct — we do
     // not replicate that; it silently breaks DNS.)

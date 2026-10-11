@@ -125,7 +125,19 @@ Config makeE2eConfig(const std::wstring& rulePath, uint16_t socksPort,
     c.routing.bypassPrivate = false;   // targets are the LAN address
     c.routing.blockUdpForRules = false;
     c.proxy.healthIntervalS = 30;      // keep health quiet
+    c.nodeMonitor.enabled = false;    // do not probe the mock HTTP listener
+    c.proxy.clashApi.host.clear();
     return c;
+}
+
+void isolateBackgroundWork(Engine& engine) {
+    // These phases verify packet routing, not controller discovery. Automatic
+    // controller probes would add unrelated requests to the HTTP assertions.
+    engine.setKernelDiscoveryEnabled(false);
+    engine.setKernelCacheLoader([] { return std::vector<DiscoveredKernel>{}; });
+    // Greeting-only health checks keep every phase local and leave SOCKS
+    // CONNECT counts specific to the test client. Dead listeners still fail.
+    engine.setHealthProbeDstForTest({0, 0});
 }
 
 std::atomic<int> g_statusCount{0};
@@ -168,6 +180,7 @@ int main() {
     {
         EngineEvents noEvents;
         Engine engine(makeWinDivertDevice(), std::move(noEvents));
+        isolateBackgroundWork(engine);
         std::string err;
         Config cfg = makeE2eConfig(targetExe, socks.port(), relayPort);
         if (!engine.start(cfg, &err)) {
@@ -176,7 +189,10 @@ int main() {
         }
         int rc = runClient(targetExe, lanIp, http.port());
         engine.stop();
-        bool phase1 = rc == 0 && socks.requestCount() == 1 && http.hits() == 1;
+        bool phase1 = rc == 0 && socks.requestCount() == 1 && http.hits() == 1 &&
+                      socks.request(0).dstIp == lanIp &&
+                      socks.request(0).dstPort == http.port() &&
+                      http.hit(0).requestLine == "GET / HTTP/1.1";
         std::printf("phase1 (rule via socks): rc=%d socks=%zu http=%zu -> %s\n", rc,
                     socks.requestCount(), http.hits(), phase1 ? "OK" : "FAIL");
         if (!phase1) {
@@ -196,6 +212,7 @@ int main() {
     {
         EngineEvents noEvents;
         Engine engine(makeWinDivertDevice(), std::move(noEvents));
+        isolateBackgroundWork(engine);
         std::string err;
         Config cfg = makeE2eConfig(targetExe, socks.port(), relayPort);
         if (!engine.start(cfg, &err)) {
@@ -218,6 +235,7 @@ int main() {
     {
         EngineEvents noEvents;
         Engine engine(makeWinDivertDevice(), std::move(noEvents));
+        isolateBackgroundWork(engine);
         std::string err;
         Config cfg = makeE2eConfig(targetExe, socks.port(), relayPort);
         if (!engine.start(cfg, &err)) {
@@ -247,6 +265,7 @@ int main() {
             lastStatus = s;
         };
         Engine engine(makeWinDivertDevice(), std::move(ev));
+        isolateBackgroundWork(engine);
         Config cfg = makeE2eConfig(targetExe, 1 /* dead port */, relayPort);
         cfg.proxy.healthIntervalS = 1;
         cfg.proxy.healthTimeoutMs = 500;
@@ -258,11 +277,12 @@ int main() {
         }
         bool degraded = false;
         for (int i = 0; i < 160; ++i) {
-            std::lock_guard<std::mutex> lk(mu);
-            if (lastStatus.find("\"DEGRADED\"") != std::string::npos) {
-                degraded = true;
-                break;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                degraded = lastStatus.find("\"DEGRADED\"") != std::string::npos;
             }
+            if (degraded) break;
+            // Let the status callback acquire mu while waiting for health.
             Sleep(100);
         }
         if (!degraded) {

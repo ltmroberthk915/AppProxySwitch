@@ -4,7 +4,7 @@ Per-application network routing for Windows. Route selected applications' TCP
 connections through a local SOCKS5 endpoint, with independent rules, multiple
 outlets, automatic core discovery, and an active connections view.
 
-Current version: **1.3.0**. This repository is private; downloads require access.
+Current version: **1.3.0**.
 
 ## Downloads
 

@@ -118,6 +118,7 @@ Config makeE2eConfig(const std::wstring& rulePath, uint16_t socksPort,
     r.name = "targetapp";
     r.path = wideToUtf8(rulePath);
     r.enabled = true;
+    r.includeChildren = false;
     c.rules.push_back(r);
     c.proxy.host = "127.0.0.1";
     c.proxy.port = socksPort;

@@ -1,0 +1,31 @@
+# Build outputs
+build/
+build-*/
+dist/
+out/
+
+# WinDivert is fetched from the official release (see third_party/README.md)
+third_party/windivert/
+
+# Visual Studio / tooling
+.vs/
+.vscode/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Misc
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+
+# Local dev tools (portable CMake etc.)
+tools/
+.claude/
+
+# Per-machine data
+config.json
+kernel_cache.json
+*.dmp

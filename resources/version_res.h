@@ -1,0 +1,12 @@
+// Version numbers for the .rc file. Kept in sync with CMake project version.
+#define APS_RC_VER_MAJOR 1
+#define APS_RC_VER_MINOR 3
+#define APS_RC_VER_PATCH 0
+
+#define APS_RC_FILEVERSION APS_RC_VER_MAJOR,APS_RC_VER_MINOR,APS_RC_VER_PATCH,0
+#define APS_RC_STRINGIFY2(x) #x
+#define APS_RC_STRINGIFY(x) APS_RC_STRINGIFY2(x)
+#define APS_RC_VERSION_STRING APS_RC_STRINGIFY(APS_RC_VER_MAJOR) "." \
+    APS_RC_STRINGIFY(APS_RC_VER_MINOR) "." APS_RC_STRINGIFY(APS_RC_VER_PATCH) ".0"
+
+#define IDI_APP_ICON 101

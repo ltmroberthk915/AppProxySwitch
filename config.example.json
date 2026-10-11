@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 7891,
+    "protocol": "socks5",
+    "username": "",
+    "password_enc": "",
+    "clash_api": { "host": "", "port": 0, "secret_enc": "" },
+    "connect_timeout_ms": 5000,
+    "io_timeout_ms": 15000,
+    "health_check_interval_s": 10,
+    "health_check_timeout_ms": 3000,
+    "health_fail_threshold": 2
+  },
+  "relay": {
+    "listen": "127.0.0.1",
+    "port": 12753
+  },
+  "rules": [
+    {
+      "id": "example-disabled-rule",
+      "name": "示例规则（请替换为你的程序）",
+      "path": "C:\\Path\\To\\YourApp.exe",
+      "enabled": false,
+      "include_children": true,
+      "outlet": "",
+      "action": "proxy"
+    }
+  ],
+  "exclusions": {
+    "builtin": true,
+    "builtin_names": [
+      "clash.exe", "clash-win64.exe", "clash-meta.exe", "mihomo.exe",
+      "mihomo-windows-amd64.exe", "verge-mihomo.exe", "MihomoParty.exe"
+    ],
+    "extra_paths": [],
+    "extra_names": []
+  },
+  "routing": {
+    "bypass_loopback": true,
+    "bypass_private": true,
+    "block_udp_for_rules": true,
+    "block_ipv6_for_rules": true,
+    "dns_cleanup": true,
+    "dns_cleanup_global": false,
+    "ipv6_enabled": false,
+    "auto_outlet_id": "",
+    "cover_app_dir_always": true,
+    "dns_servers": []
+  },
+  "node_monitor": {
+    "enabled": true,
+    "interval_s": 60,
+    "fail_threshold": 2,
+    "delay_url": "http://www.gstatic.com/generate_204",
+    "delay_timeout_ms": 3000,
+    "max_latency_ms": 800,
+    "region": "",
+    "node_class": "IEPL",
+    "real_fail_threshold": 4,
+    "real_fail_ratio_pct": 40,
+    "real_fail_window_s": 60,
+    "bad_node_cooldown_s": 600
+  },
+  "subscription": {
+    "auto_refresh": false,
+    "interval_hours": 24,
+    "start_delay_min": 10
+  },
+  "outlets": [],
+  "fail_mode": "open",
+  "logging": {
+    "level": "info",
+    "max_file_mb": 10,
+    "max_files": 5
+  },
+  "ui": {
+    "autostart": false,
+    "start_minimized": false,
+    "confirm_stop": true
+  },
+  "advanced": {
+    "nat_idle_timeout_s": 86400,
+    "syn_wait_s": 30,
+    "max_sessions": 1024,
+    "socket_map_ttl_s": 120
+  }
+}

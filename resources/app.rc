@@ -1,0 +1,50 @@
+// AppProxySwitch resource script. UTF-8 encoded (see code_page pragma below).
+#pragma code_page(65001)
+
+#include <windows.h>
+#include "version_res.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// Icon
+IDI_APP_ICON ICON "AppProxySwitch.ico"
+
+/////////////////////////////////////////////////////////////////////////////
+// Manifest (embedded, asInvoker)
+1 RT_MANIFEST "app.manifest"
+
+/////////////////////////////////////////////////////////////////////////////
+// Version
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    APS_RC_FILEVERSION
+ PRODUCTVERSION APS_RC_FILEVERSION
+ FILEFLAGSMASK  0x3fL
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"   // 简体中文, Unicode
+        BEGIN
+            VALUE "CompanyName",      "AppProxySwitch Contributors"
+            VALUE "FileDescription",  "AppProxySwitch 单应用代理开关"
+            VALUE "FileVersion",      APS_RC_VERSION_STRING
+            VALUE "InternalName",     "AppProxySwitch"
+            VALUE "LegalCopyright",   "MIT License. Bundled WinDivert (LGPL-3.0/GPL-2.0 dual license) is distributed unmodified; see LICENSES\\."
+            VALUE "OriginalFilename", "AppProxySwitch.exe"
+            VALUE "ProductName",      "AppProxySwitch"
+            VALUE "ProductVersion",   APS_RC_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

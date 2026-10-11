@@ -1,0 +1,43 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch WinDivert (official release, SHA-256 pinned)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-windivert.ps1
+
+      - name: Configure (Release x64)
+        run: cmake --preset release
+
+      - name: Build
+        run: cmake --build --preset release --config Release
+
+      - name: Unit tests
+        run: ctest --test-dir build/release -C Release -L unit --output-on-failure
+
+      - name: Integration tests (local loopback mocks)
+        run: ctest --test-dir build/release -C Release -L integration --output-on-failure
+
+      - name: WinDivert e2e tests (requires admin; GH runners are elevated)
+        run: ctest --test-dir build/release -C Release -L windivert --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File package-release.ps1
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppProxySwitch-win64
+          path: dist/*.zip
+          if-no-files-found: error

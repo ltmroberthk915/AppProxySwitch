@@ -205,6 +205,25 @@ void RelaySession::abort() {
 }
 
 void RelaySession::run(std::function<void(RelaySession&)> onDone) {
+    const auto startedAt = std::chrono::steady_clock::now();
+    auto elapsedMs = [&] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - startedAt).count();
+    };
+    const char* firstEof = "none";
+    int64_t firstEofMs = -1;
+    auto noteEof = [&](const char* side) {
+        // shutdown() from abort() can wake recv as EOF too. Keep that
+        // teardown distinct from a peer's observed orderly close.
+        if (abortFlag_.load()) return;
+        if (firstEofMs < 0) {
+            firstEof = side;
+            firstEofMs = elapsedMs();
+        }
+        log::ifmt("relay flow={} eof_side={} first_eof={} at_ms={} up={} down={}; "
+                  "peer EOF does not verify HTTP/WSS completion", id_, side,
+                  firstEof, elapsedMs(), bytesUp_.load(), bytesDown_.load());
+    };
     log::ifmt("relay flow={} pid={} source={}:{} peer={}:{} destination={}:{} outlet={}",
               id_, target_.originalPid, formatIpv4(target_.origSource.ip), target_.origSource.port,
               formatIpv4(appPeer_.ip), appPeer_.port, formatIpv4(target_.origDst.ip),
@@ -224,9 +243,10 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         } else if (!err.empty()) {
             error_ = err;
         }
-        log::ifmt("relay flow={} completed={} failure={} up={} down={} detail={}",
-                  id_, ok, relayFailureKindName(failureKind), bytesUp_.load(),
-                  bytesDown_.load(), error_);
+        log::ifmt("relay flow={} tcp_completed={} application_completion=unverified "
+                  "failure={} first_eof={} first_eof_ms={} duration_ms={} "
+                  "up={} down={} detail={}", id_, ok, relayFailureKindName(failureKind),
+                  firstEof, firstEofMs, elapsedMs(), bytesUp_.load(), bytesDown_.load(), error_);
         net::closeSocket(socksSock_);
         net::closeSocket(appSock_);
         if (target_.sink) target_.sink->onClosed();
@@ -366,6 +386,7 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
             int r = ::recv(appSock_, buf.data(), static_cast<int>(buf.size()), 0);
             if (r == 0) {
                 appEof = true;
+                noteEof("application");
                 shutdown(socksSock_, SD_SEND);
             } else if (r == SOCKET_ERROR) {
                 finish(false, RelayFailureKind::Application,
@@ -386,6 +407,7 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
             int r = ::recv(socksSock_, buf.data(), static_cast<int>(buf.size()), 0);
             if (r == 0) {
                 socksEof = true;
+                noteEof("proxy");
                 shutdown(appSock_, SD_SEND);
             } else if (r == SOCKET_ERROR) {
                 finish(false, RelayFailureKind::Tunnel,

@@ -124,6 +124,85 @@ APS_TEST(clashapi, rule_mode_uses_referenced_nested_selector_instead_of_global) 
     EXPECT_EQ(groups.size(), 5u);
 }
 
+APS_TEST(clashapi, rule_mode_prefers_service_selector_without_using_unreferenced_groups) {
+    MockClashApi api;
+    api.mode = "rule";
+    api.groups = {{"General", {"node-a", "node-b", "node-c"}},
+                  {"Service", {"node-b", "node-c"}},
+                  {"Unused", {"node-a", "node-b", "node-c", "node-d"}}};
+    api.groupSelections = {{"General", "node-a"}, {"Service", "node-b"}, {"Unused", "node-d"}};
+    api.rulePolicies = {"Service", "General"};
+    EXPECT_TRUE(api.start());
+    ClashApiClient client("127.0.0.1", api.port(), "");
+    std::string error;
+    for (const auto& preferences : std::vector<std::vector<std::string>>{
+             {"Service"}, {"missing", "Service"}, {"Unused", "Service"}}) {
+        auto group = client.currentSelectorGroup(&error, 1500, nullptr, nullptr, preferences);
+        EXPECT_TRUE(group.has_value());
+        if (group) { EXPECT_STREQ(group->name, "Service"); EXPECT_STREQ(group->now, "node-b"); }
+    }
+    auto fallback = client.currentSelectorGroup(&error, 1500, nullptr, nullptr, {"Unused", "missing"});
+    EXPECT_TRUE(fallback.has_value());
+    if (fallback) EXPECT_STREQ(fallback->name, "General");
+    EXPECT_TRUE(api.switches().empty());
+}
+
+APS_TEST(clashapi, preferred_rule_selector_retains_outer_target_and_resolves_nested_leaf) {
+    MockClashApi api;
+    api.mode = "rule";
+    api.groups = {{"General", {"node-a", "node-b", "node-c"}},
+                  {"Service", {"Automatic"}},
+                  {"Automatic", {"node-b", "node-c"}}};
+    api.groupTypes["Automatic"] = "URLTest";
+    api.groupSelections = {{"General", "node-a"}, {"Service", "Automatic"}, {"Automatic", "node-b"}};
+    api.rulePolicies = {"Service", "General"};
+    EXPECT_TRUE(api.start());
+    ClashApiClient client("127.0.0.1", api.port(), ""); std::string error;
+    auto group = client.currentSelectorGroup(&error, 1500, nullptr, nullptr, {"Service"});
+    EXPECT_TRUE(group.has_value());
+    if (group) {
+        EXPECT_STREQ(group->name, "Service");
+        EXPECT_STREQ(group->now, "node-b");
+        EXPECT_EQ(group->nodes.size(), 1u);
+        EXPECT_STREQ(group->nodes.front(), "Automatic");
+    }
+    EXPECT_TRUE(api.switches().empty());
+}
+
+APS_TEST(clashapi, group_preferences_do_not_override_global_legacy_or_direct_mode) {
+    for (const auto* mode : {"global", "", "direct"}) {
+        MockClashApi api;
+        api.mode = mode;
+        api.groups = {{"GLOBAL", {"node-a", "node-b"}}, {"Service", {"node-b"}}};
+        api.groupSelections = {{"GLOBAL", "node-a"}, {"Service", "node-b"}};
+        api.rulePolicies = {"Service"};
+        EXPECT_TRUE(api.start());
+        ClashApiClient client("127.0.0.1", api.port(), ""); std::string error;
+        auto group = client.currentSelectorGroup(&error, 1500, nullptr, nullptr, {"Service"});
+        if (std::string(mode) == "direct") EXPECT_FALSE(group.has_value());
+        else {
+            EXPECT_TRUE(group.has_value());
+            if (group) EXPECT_STREQ(group->name, "GLOBAL");
+        }
+        EXPECT_TRUE(api.switches().empty());
+    }
+}
+
+APS_TEST(clashapi, invalid_preferred_rule_chain_is_reported_without_general_fallback) {
+    MockClashApi api;
+    api.mode = "rule";
+    api.groups = {{"General", {"node-a", "node-b", "node-c"}},
+                  {"Service", {"Automatic"}}, {"Automatic", {"Service"}}};
+    api.groupTypes["Automatic"] = "URLTest";
+    api.groupSelections = {{"General", "node-a"}, {"Service", "Automatic"}, {"Automatic", "Service"}};
+    api.rulePolicies = {"General", "Service"};
+    EXPECT_TRUE(api.start());
+    ClashApiClient client("127.0.0.1", api.port(), ""); std::string error;
+    EXPECT_FALSE(client.currentSelectorGroup(&error, 1500, nullptr, nullptr, {"Service"}).has_value());
+    EXPECT_FALSE(error.empty());
+    EXPECT_TRUE(api.switches().empty());
+}
+
 APS_TEST(clashapi, runtime_direct_mode_and_missing_rule_targets_are_not_guessed) {
     for (const auto* mode : {"direct", "rule"}) {
         MockClashApi api; api.mode = mode;

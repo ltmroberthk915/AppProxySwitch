@@ -9,6 +9,7 @@ param(
     [int]$TimeoutMs = 2000
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'aps-route-evidence.ps1')
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -20,7 +21,7 @@ public static class ApsControllerDiagnostic {
 
 function Read-Controller {
     param([string]$PipeName, [string]$Resource)
-    if ($Resource -notin @('/version', '/configs', '/proxies')) { throw 'Read endpoint rejected.' }
+    if ($Resource -notin @('/version', '/configs', '/proxies', '/connections')) { throw 'Read endpoint rejected.' }
     $stream = [IO.Pipes.NamedPipeClientStream]::new('.', $PipeName,
         [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous,
         [Security.Principal.TokenImpersonationLevel]::Identification)
@@ -93,6 +94,13 @@ foreach ($candidate in $candidates) {
         if (-not $version.version) { throw 'Version identity missing.' }
         $config = Read-Controller $short '/configs'
         $proxies = Read-Controller $short '/proxies'
+        $apsRouteError = $null
+        $apsRoutes = @()
+        try {
+            $apsSources = @(Get-ApsRelaySourceKeys @([int]$config.'mixed-port', [int]$config.'socks-port'))
+            $apsConnections = Read-Controller $short '/connections'
+            $apsRoutes = @(Select-ApsBusinessRoutes $apsConnections.connections $apsSources)
+        } catch { $apsRouteError = 'Connection route metadata unavailable.' }
         [pscustomobject]@{
             pid = $CorePid
             process = $core.ProcessName
@@ -105,7 +113,9 @@ foreach ($candidate in $candidates) {
             } | ForEach-Object {
                 [pscustomobject]@{ name = $_.Name; selected = $_.Value.now; members = @($_.Value.all).Count }
             })
-            scope = 'GET /version, /configs and /proxies only; no changes or delay tests.'
+            aps_business_routes = $apsRoutes
+            route_error = $apsRouteError
+            scope = 'Controller GETs and local socket ownership only; no changes or delay tests. Observed chains do not verify HTTP/WSS stream completion.'
         } | ConvertTo-Json -Depth 5
     } catch {
         # Do not expose raw controller replies, credentials, or subscription URLs.

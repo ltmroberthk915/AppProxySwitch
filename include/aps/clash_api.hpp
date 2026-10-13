@@ -64,10 +64,14 @@ public:
     // Selector group. When `all` is non-null it receives EVERY group with
     // its node list (used for group-membership class matching, e.g.
     // "GROUP:🤖AI服务").
+    // In rule mode, configured GROUP preferences also prioritize an active
+    // rule-referenced Selector. Membership overlap does not mean two groups
+    // share their current selection. Global/legacy modes keep their target.
     std::optional<ClashGroup> currentSelectorGroup(
         std::string* err, int timeoutMs = 3000,
         std::vector<ClashGroup>* all = nullptr,
-        std::string* runtimeMode = nullptr);
+        std::string* runtimeMode = nullptr,
+        const std::vector<std::string>& preferredGroups = {});
 
     // GET /proxies/{node}/delay?url=...&timeout=...  -> latency ms;
     // -1 on timeout/failure (node dead).

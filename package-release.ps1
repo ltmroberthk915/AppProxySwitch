@@ -27,6 +27,8 @@ Copy-Item (Join-Path $wd 'WinDivert64.sys') $dist
 Copy-Item (Join-Path $root 'config.example.json') $dist
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'scripts') | Out-Null
 Copy-Item (Join-Path $root 'scripts\diagnose-business-route.ps1') (Join-Path $dist 'scripts')
+Copy-Item (Join-Path $root 'scripts\diagnose-kernel-controller.ps1') (Join-Path $dist 'scripts')
+Copy-Item (Join-Path $root 'scripts\aps-route-evidence.ps1') (Join-Path $dist 'scripts')
 foreach ($doc in @('README.md', 'README.en.md')) {
     $p = Join-Path $root $doc
     if (Test-Path $p) { Copy-Item $p $dist }

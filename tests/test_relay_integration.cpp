@@ -6,8 +6,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 #include "aps/dns_rewrite.hpp"
+#include "aps/log.hpp"
 #include "aps/net.hpp"
 #include "aps/relay_server.hpp"
 #include "mock_http_server.hpp"
@@ -63,6 +66,80 @@ bool waitUntil(const std::function<bool()>& pred, int timeoutMs) {
     }
     return pred();
 }
+
+struct TempRelayLog {
+    std::wstring dir;
+    bool opened = false;
+    TempRelayLog() {
+        wchar_t temp[MAX_PATH]{};
+        if (!GetTempPathW(MAX_PATH, temp)) return;
+        static std::atomic<unsigned> next{0};
+        dir = std::wstring(temp) + L"aps-relay-log-" + std::to_wstring(GetCurrentProcessId()) +
+              L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(next++);
+        opened = log::init(dir, log::Level::Info, 1, 1);
+    }
+    std::string read() {
+        log::shutdown();
+        std::ifstream file(std::filesystem::path(dir + L"\\aps.log"), std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    ~TempRelayLog() {
+        log::shutdown();
+        if (!dir.empty()) {
+            DeleteFileW((dir + L"\\aps.log").c_str());
+            RemoveDirectoryW(dir.c_str());
+        }
+    }
+};
+
+// A single loopback response with intentional idle gaps. The truncated variant
+// advertises a longer HTTP body but still sends an orderly TCP FIN.
+struct StreamingResponseServer {
+    SOCKET listener = INVALID_SOCKET;
+    std::atomic<SOCKET> client{INVALID_SOCKET};
+    std::atomic<bool> stopping{false};
+    std::thread worker;
+    uint16_t port = 0;
+    bool start(std::string response) {
+        listener = net::makeTcpSocket();
+        auto address = net::toSockaddr({0x7F000001, 0});
+        if (::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
+            listen(listener, 1) != 0) return false;
+        int len = sizeof(address);
+        if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &len) != 0) return false;
+        port = ntohs(address.sin_port);
+        worker = std::thread([this, socket = listener, response = std::move(response)] {
+            SOCKET accepted = accept(socket, nullptr, nullptr);
+            if (accepted == INVALID_SOCKET) return;
+            client.store(accepted);
+            std::string request;
+            char buffer[4096];
+            while (!stopping.load() && request.size() < 65536 &&
+                   request.find("\r\n\r\n") == std::string::npos) {
+                int n = net::recvSome(accepted, buffer, sizeof(buffer), 2000);
+                if (n <= 0) break;
+                request.append(buffer, static_cast<size_t>(n));
+            }
+            for (size_t offset = 0; !stopping.load() && offset < response.size(); offset += 16384) {
+                if (offset) Sleep(80); // exceeds the relay's per-send timeout
+                const auto size = std::min<size_t>(16384, response.size() - offset);
+                if (net::sendAll(accepted, response.data() + offset, size, 2000) != 0) break;
+            }
+            shutdown(accepted, SD_SEND);
+            while (!stopping.load() && net::recvSome(accepted, buffer, sizeof(buffer), 1000) > 0) {}
+            client.store(INVALID_SOCKET);
+            net::closeSocket(accepted);
+        });
+        return true;
+    }
+    ~StreamingResponseServer() {
+        stopping.store(true);
+        const auto accepted = client.load();
+        if (accepted != INVALID_SOCKET) shutdown(accepted, SD_BOTH);
+        net::closeSocket(listener);
+        if (worker.joinable()) worker.join();
+    }
+};
 
 std::vector<uint8_t> buildDnsQuery(const std::string& name,
                                    uint16_t id = 0x1234) {
@@ -224,6 +301,8 @@ APS_TEST(relay, end_to_end_get_through_socks) {
 }
 
 APS_TEST(relay, half_close_propagates) {
+    TempRelayLog diagnostic;
+    EXPECT_TRUE(diagnostic.opened);
     MockHttpServer http;
     EXPECT_TRUE(http.start());
     MockSocks5Server socks;
@@ -255,9 +334,61 @@ APS_TEST(relay, half_close_propagates) {
     int n;
     while ((n = net::recvSome(cli.s, buf, sizeof(buf), 5000)) > 0) resp.append(buf, static_cast<size_t>(n));
     EXPECT_TRUE(resp.find("200 OK") != std::string::npos);
+    EXPECT_TRUE(waitUntil([&] { return relay.counters.completed.load() == 1; }, 2000));
     relay.stop();
     socks.stop();
     http.stop();
+    const auto lines = diagnostic.read();
+    EXPECT_TRUE(lines.find("first_eof=application") != std::string::npos);
+    EXPECT_TRUE(lines.find("tcp_completed=true") != std::string::npos);
+}
+
+APS_TEST(relay, streaming_fin_does_not_claim_http_completion_or_cut_idle_reads) {
+    for (const bool truncated : {false, true}) {
+        TempRelayLog diagnostic;
+        EXPECT_TRUE(diagnostic.opened);
+        const std::string body = "PAYLOAD_MUST_NOT_APPEAR" + std::string(128 * 1024, 'x');
+        const std::string response = "HTTP/1.1 200 OK\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\n\r\n" + (truncated ? body.substr(0, 22) : body);
+        StreamingResponseServer upstream;
+        EXPECT_TRUE(upstream.start(response));
+        MockSocks5Server socks;
+        EXPECT_TRUE(socks.start());
+        PreparedClient cli;
+        EXPECT_TRUE(cli.bind());
+        RelayParams params;
+        params.proxy = socks.endpoint();
+        params.pumpTimeoutMs = 50;
+        RelayServer relay;
+        EXPECT_TRUE(relay.start(params, 0, [&](uint32_t ip, uint16_t port) {
+            if (ip != cli.local.ip || port != cli.local.port) return std::optional<RelayTarget>();
+            RelayTarget target;
+            target.origDst = {0x7F000001, upstream.port};
+            return std::optional<RelayTarget>(std::move(target));
+        }, nullptr));
+        const auto address = net::toSockaddr({0x7F000001, relay.listenPort()});
+        EXPECT_EQ(::connect(cli.s, reinterpret_cast<const sockaddr*>(&address), sizeof(address)), 0);
+        const char* request = "GET /stream HTTP/1.1\r\nHost: unit\r\n\r\n";
+        EXPECT_EQ(net::sendAll(cli.s, request, std::strlen(request), 2000), 0);
+        std::string received;
+        char buffer[8192];
+        int n = 0;
+        while ((n = net::recvSome(cli.s, buffer, sizeof(buffer), 3000)) > 0)
+            received.append(buffer, static_cast<size_t>(n));
+        EXPECT_EQ(n, 0);
+        EXPECT_STREQ(received, response);
+        shutdown(cli.s, SD_SEND);
+        EXPECT_TRUE(waitUntil([&] { return relay.counters.completed.load() == 1; }, 2000));
+        relay.stop();
+        socks.stop();
+        const auto lines = diagnostic.read();
+        EXPECT_TRUE(lines.find("first_eof=proxy") != std::string::npos);
+        EXPECT_TRUE(lines.find("tcp_completed=true") != std::string::npos);
+        EXPECT_TRUE(lines.find("application_completion=unverified") != std::string::npos);
+        EXPECT_TRUE(lines.find("first_eof_ms=-1") == std::string::npos);
+        EXPECT_TRUE(lines.find("duration_ms=") != std::string::npos);
+        EXPECT_TRUE(lines.find("PAYLOAD_MUST_NOT_APPEAR") == std::string::npos);
+    }
 }
 
 APS_TEST(relay, unknown_peer_is_rejected) {

@@ -192,7 +192,7 @@ ClashApiClient::ProbeResult ClashApiClient::probeAny(int timeoutMs) {
 
 std::optional<ClashGroup> ClashApiClient::currentSelectorGroup(
     std::string* err, int timeoutMs, std::vector<ClashGroup>* allGroups,
-    std::string* runtimeMode) {
+    std::string* runtimeMode, const std::vector<std::string>& preferredGroups) {
     if (runtimeMode) runtimeMode->clear();
     ClashApiResult r = request("GET", "/proxies", "", timeoutMs);
     if (!r.ok) {
@@ -312,6 +312,14 @@ std::optional<ClashGroup> ClashApiClient::currentSelectorGroup(
             }
             const ClashGroup* chosen = nullptr;
             size_t breadth = 0;
+            std::set<std::string> referencedSelectors;
+            auto concreteMembers = [&](const ClashGroup& g) {
+                size_t count = 0;
+                for (const auto& node : g.nodes)
+                    if (!groups.count(node) && node != "DIRECT" && node != "REJECT" &&
+                        node != "REJECT-DROP" && node != "PASS" && node != "COMPATIBLE") ++count;
+                return count;
+            };
             for (size_t i = 0; i < list->size(); ++i) {
                 const auto* proxy = list->at(i).find("proxy");
                 if (!proxy || !proxy->isString()) continue;
@@ -321,17 +329,34 @@ std::optional<ClashGroup> ClashApiClient::currentSelectorGroup(
                 while (visited.insert(target).second) {
                     const auto group = groups.find(target);
                     if (group == groups.end()) break;
-                    if (group->second.type == "Selector" && !group->second.now.empty()) active = &group->second;
+                    if (group->second.type == "Selector" && !group->second.now.empty()) {
+                        active = &group->second;
+                        if (target != "GLOBAL") referencedSelectors.insert(target);
+                    }
                     target = group->second.now;
                 }
                 if (!active || active->name == "GLOBAL") continue;
-                size_t concrete = 0;
-                for (const auto& node : active->nodes)
-                    if (!groups.count(node) && node != "DIRECT" && node != "REJECT" && node != "PASS" && node != "COMPATIBLE") ++concrete;
+                const auto concrete = concreteMembers(*active);
                 // Use the broadest selector referenced by the actual rules.
                 // Service-specific groups keep their independent selections.
                 if (concrete && (!chosen || concrete > breadth)) { chosen = active; breadth = concrete; }
             }
+            const ClashGroup* preferred = nullptr;
+            size_t preferredBreadth = 0;
+            for (const auto& name : preferredGroups) {
+                if (!referencedSelectors.count(name)) continue;
+                const auto& candidate = groups.at(name);
+                const auto concrete = concreteMembers(candidate);
+                if (!preferred || concrete > preferredBreadth ||
+                    (concrete == preferredBreadth && name < preferred->name)) {
+                    preferred = &candidate;
+                    preferredBreadth = concrete;
+                }
+            }
+            // Preserve the exact service Selector as the switching target,
+            // even when its current selection goes through another group.
+            // Unreferenced membership-only groups never redirect monitoring.
+            if (preferred) return resolveSelectedNode(*preferred);
             if (!chosen) {
                 if (err) *err = "规则未指向包含具体节点的可切换策略组";
                 return std::nullopt;

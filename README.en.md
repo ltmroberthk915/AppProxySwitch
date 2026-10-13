@@ -4,28 +4,28 @@ Per-application network routing for Windows. Route selected applications' TCP
 connections through a local SOCKS5 endpoint, with independent rules, multiple
 outlets, automatic core discovery, and an active connections view.
 
-Current version: **1.3.0**.
+Current version: **1.3.1**.
 
 ## Downloads
 
-The [1.3.0 release](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.0)
+The [1.3.1 release](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.1)
 provides a Windows x64 installer and a portable ZIP. Stop the engine and exit
 from the tray before upgrading.
 
-## Changes in 1.3.0
+## Changes in 1.3.1
 
-- Offline cores show their names without old ports. Duplicate unbound history
-  is grouped; selected or explicitly rule-bound offline outlets remain visible.
-- Automatic discovery cache v3 omits standalone SOCKS/API TCP port fields.
-  Running instances are revalidated, with stable outlet IDs and automatic
-  migration of older caches on the first scan.
-- Node details have a vertical scrollbar and measured text wrapping. Mouse
-  wheel, scrollbar dragging, and display scaling changes are supported.
-- Includes idle receive heartbeats, runtime mode display, and read-only
-  application routing diagnostics.
+- Rule mode prioritizes configured GROUP preferences that identify active,
+  rule-referenced service selectors, retaining the selector as the switch target.
+- Node details identify the measured policy scope; changing scope clears stale
+  latency and preference state.
+- Relay logs record the first observed EOF side and timing, distinguish TCP
+  completion from unverified application completion, and preserve half-close.
+- Read-only diagnostics attribute connections by local socket ownership when
+  process metadata is absent. TCP, named-pipe and shared diagnostic scripts ship
+  with the release.
 
-See the [release notes](docs/RELEASE-1.3.0-KERNEL-HISTORY-SCROLL.md) and
-[validation record](docs/VALIDATION-1.3.0.md).
+See the [release notes](docs/RELEASE-1.3.1-POLICY-MONITOR.md) and
+[validation record](docs/VALIDATION-1.3.1.md).
 
 ## Usage
 

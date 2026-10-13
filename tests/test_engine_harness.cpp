@@ -3178,6 +3178,51 @@ APS_TEST(engine, group_membership_class_selection) {
     api.stop();
 }
 
+APS_TEST(engine, rule_mode_monitors_and_recovers_preferred_service_group) {
+    // Both policies are used by rules and share nodes. The larger general
+    // selector is healthy, but it says nothing about the independently
+    // selected service node. GROUP preferences must choose the service's
+    // switching target as well as filter its candidates.
+    for (const bool serviceDead : {false, true}) {
+        MockClashApi api;
+        api.mode = "rule";
+        api.groups = {{"General route", {"SG relay", "US relay", "JP relay"}},
+                      {"Service route", {"US relay", "JP relay"}}};
+        api.groupSelections = {{"General route", "SG relay"},
+                               {"Service route", "US relay"}};
+        api.rulePolicies = {"Service route", "General route"};
+        api.latencies = {{"SG relay", 5}, {"JP relay", 60}};
+        if (!serviceDead) api.latencies["US relay"] = 40;
+        EXPECT_TRUE(api.start());
+        Harness h;
+        Config c = h.makeConfig();
+        c.rules.clear();
+        c.proxy.clashApi.host = "127.0.0.1";
+        c.proxy.clashApi.port = api.port();
+        c.nodeMonitor.nodeClasses = {"GROUP:Service route"};
+        c.nodeMonitor.regions.clear();
+        c.nodeMonitor.failThreshold = 1;
+        h.start(c);
+        h.engine->requestNodeSwitchRound("__default__", true, "service-route");
+        EXPECT_TRUE(h.waitStatus([](const std::string& text) {
+            auto row = outletStatusFor(text, "__default__");
+            return row.find("test_request_id") &&
+                   row.find("test_request_id")->asString() == "service-route" &&
+                   row.find("switching") && !row.find("switching")->asBool();
+        }, 8000));
+        auto row = outletStatusFor(h.lastStatus(), "__default__");
+        EXPECT_TRUE(row.find("group") && row.find("group")->asString() == "Service route");
+        EXPECT_TRUE(row.find("node") && row.find("node")->asString() ==
+                    (serviceDead ? "JP relay" : "US relay"));
+        const auto switches = api.switches();
+        EXPECT_EQ(switches.size(), serviceDead ? 1u : 0u);
+        if (serviceDead && !switches.empty())
+            EXPECT_STREQ(switches.front(), ClashApiClient::urlEncode("Service route") + "::JP relay");
+        h.stop();
+        api.stop();
+    }
+}
+
 APS_TEST(engine, group_absent_class_is_inert) {
     // A wanted "GROUP:<name>" that THIS controller does not expose at all is
     // unsatisfiable (measured: GROUP:AI服务 selected globally while the
@@ -4911,7 +4956,11 @@ APS_TEST(engine, portless_cache_keeps_selected_instance_and_rediscovers_current_
             if (rows.size() != 2) return false;
             for (const auto& row : rows) {
                 if (row.find("id")->asString() == primary.id)
-                    return row.find("alive")->asBool() && row.find("socks_port")->asInt() == live.socksPort;
+                    // Discovery metadata is published before the egress
+                    // snapshot is rebuilt. Wait for both parts of adoption.
+                    return row.find("alive")->asBool() && row.find("socks_port")->asInt() == live.socksPort &&
+                           h.engine->outletEnabled(primary.id) &&
+                           h.engine->outletParams(primary.id).proxy.port == live.socksPort;
             }
             return false;
         }, 3000));
@@ -4947,7 +4996,7 @@ APS_TEST(engine, portless_cache_ambiguous_instances_do_not_steal_selected_outlet
     h.cacheLoader = [] { return loadKernelCache(); };
     h.discoveryScan = [a, b](DiscoveryMode) { return std::vector<DiscoveredKernel>{a, b}; };
     h.start(c, true);
-    EXPECT_TRUE(h.waitStatus([](const std::string& text) {
+    EXPECT_TRUE(h.waitStatus([&](const std::string& text) {
         json::Value status;
         if (!json::Value::parse(text, status, nullptr) || !status.find("kernels")) return false;
         const auto& rows = status.find("kernels")->array();
@@ -4961,7 +5010,8 @@ APS_TEST(engine, portless_cache_ambiguous_instances_do_not_steal_selected_outlet
             }
             if (current) ++alive;
         }
-        return alive == 2;
+        return alive == 2 && !h.engine->outletEnabled("auto-ambiguous-core.exe") &&
+               h.engine->outletParams("auto-ambiguous-core.exe").proxy.port == 1;
     }, 3000));
     EXPECT_FALSE(h.engine->outletEnabled("auto-ambiguous-core.exe"));
     EXPECT_EQ(h.engine->outletParams("auto-ambiguous-core.exe").proxy.port, 1);

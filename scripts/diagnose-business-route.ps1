@@ -8,6 +8,7 @@ param(
     [switch]$SkipHttps
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'aps-route-evidence.ps1')
 $apsHeaders = @{}
 $apsLocalSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 # An empty proxy object explicitly bypasses the machine's system proxy.
@@ -75,20 +76,19 @@ if (-not $SkipHttps) {
     }
 }
 if ($ControllerPort) {
+    $apsSources = @(Get-ApsRelaySourceKeys @($Port))
     $apsConnections = Read-ApsController '/connections'
-    foreach ($apsConnection in $apsConnections.connections) {
-        $apsMeta = $apsConnection.metadata
-        if ([IO.Path]::GetFileName([string]$apsMeta.processPath) -ine 'AppProxySwitch.exe') { continue }
-        if ([string]$apsMeta.host -notmatch '^(?:[a-zA-Z0-9-]+\.)*chatgpt\.com$') { continue }
+    foreach ($apsRoute in @(Select-ApsBusinessRoutes $apsConnections.connections $apsSources)) {
         # Preserve the meaningful route evidence while hiding provider/node names.
-        $apsSafeChains = @($apsConnection.chains | ForEach-Object {
+        $apsSafeChains = @($apsRoute.chains | ForEach-Object {
             if ($_ -in @('DIRECT','REJECT','REJECT-DROP','GLOBAL')) { [string]$_ } else { '<proxy-or-group>' }
         })
         $apsResult.aps_openai_chains += [ordered]@{
-            source_port = [string]$apsMeta.sourcePort
-            target = [string]$apsMeta.host
-            rule_type = [string]$apsConnection.rule
+            source_port = $apsRoute.source_port
+            target = $apsRoute.target
+            rule_type = $apsRoute.rule_type
             chains = $apsSafeChains
+            attribution = $apsRoute.attribution
         }
     }
 }

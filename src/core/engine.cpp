@@ -2171,7 +2171,12 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     }
     st.groupNodes.clear();
     std::vector<ClashGroup> allGroups;
-    auto group = client.currentSelectorGroup(&err, 3000, &allGroups, &st.runtimeMode);
+    std::vector<std::string> preferredGroups;
+    for (const auto& wanted : nm.nodeClasses)
+        if (wanted.rfind("GROUP:", 0) == 0 && wanted.size() > 6)
+            preferredGroups.push_back(wanted.substr(6));
+    auto group = client.currentSelectorGroup(&err, 3000, &allGroups, &st.runtimeMode,
+                                            preferredGroups);
     if (st.runtimeMode != previousMode) {
         log::ifmt("outlet {} observed controller mode={}; origin=external-or-unknown "
                   "(APS does not change mode)", outletId,
@@ -2225,9 +2230,29 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     st.apiAvailable = true;
     st.apiError.clear();
     st.selectionSatisfied = true;
-    const bool sameNode = st.node == group->now;
+    const bool sameGroup = st.group == group->name;
+    const bool sameNode = sameGroup && st.node == group->now;
+    if (!sameGroup) {
+        log::ifmt("node monitor [{}]: scope changed from '{}' to '{}' (mode={})",
+                  outletId, st.group, group->name, st.runtimeMode);
+        st.latencyMs = -1;
+        st.consecutiveFails = 0;
+        st.regionApplied.clear();
+        st.regionUnavailable = false;
+        st.classApplied.clear();
+        st.classUnavailable = false;
+        st.classGroupMissing = false;
+        st.lastSwitchAt = 0;
+        st.lastSwitchDetail.clear();
+    }
     st.group = group->name;
     st.node = group->now;
+    if (st.runtimeMode == "rule") {
+        const bool configuredGroup = std::find(preferredGroups.begin(), preferredGroups.end(),
+                                               st.group) != preferredGroups.end();
+        st.routingWarning = std::string(configuredGroup ? "仅测速配置策略组「" : "仅测速通用策略组「") +
+            st.group + "」；其他业务出口及 HTTP/WSS 流完整性未验证";
+    }
     st.region = regionOfNode(st.node);
     const int previousLatencyMs = st.latencyMs;
     const int controllerLatencyMs =

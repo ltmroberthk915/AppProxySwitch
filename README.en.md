@@ -1,8 +1,9 @@
 # AppProxySwitch
 
-The **1.3.3 candidate** handles relay backpressure independently in both
-directions and retains attribution when diagnostic logs rotate. See the
-[candidate notes](docs/RELEASE-1.3.3-DUPLEX-RELAY.md). Live recovery requires
+The **1.3.4 candidate** lets an explicitly preferred service policy select a
+child group's existing matching leaf, preserving child selections. It also
+includes the 1.3.3 relay and diagnostic fixes. See the
+[candidate notes](docs/RELEASE-1.3.4-NESTED-CHOICES.md). Live recovery requires
 separate verification.
 
 Per-application network routing for Windows. Route selected applications' TCP

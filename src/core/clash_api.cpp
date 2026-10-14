@@ -264,19 +264,27 @@ std::optional<ClashGroup> ClashApiClient::currentSelectorGroup(
     auto resolveSelectedNode = [&](const ClashGroup& target) -> std::optional<ClashGroup> {
         auto selected = target;
         selected.history = nodeHistory;
-        std::set<std::string> visited{selected.name};
+        selected.selectedMember = target.now;
+        auto selectedLeaf = [&](std::string node) -> std::optional<std::string> {
+            std::set<std::string> visited{target.name};
+            while (true) {
+                const auto child = groups.find(node);
+                if (child == groups.end()) return node.empty() ? std::nullopt : std::optional<std::string>(node);
+                if (!visited.insert(node).second || child->second.now.empty()) return std::nullopt;
+                node = child->second.now;
+            }
+        };
         // A Selector can currently route through URLTest/Fallback or another
         // group. Display/probe its actual selected leaf, while retaining the
         // Selector's name and legal members as the switching target.
-        while (true) {
-            const auto child = groups.find(selected.now);
-            if (child == groups.end()) break;
-            if (!visited.insert(selected.now).second || child->second.now.empty()) {
-                if (err) *err = "当前策略组选择为空或存在循环，暂无法核对实际节点";
-                return std::nullopt;
-            }
-            selected.now = child->second.now;
+        const auto current = selectedLeaf(selected.now);
+        if (!current) {
+            if (err) *err = "当前策略组选择为空或存在循环，暂无法核对实际节点";
+            return std::nullopt;
         }
+        selected.now = *current;
+        for (const auto& member : selected.nodes)
+            if (const auto leaf = selectedLeaf(member)) selected.memberLeaves.emplace(member, *leaf);
         return selected;
     };
     // Inspect mode even when no Selector exists, and expose it independently

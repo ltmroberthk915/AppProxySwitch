@@ -3301,6 +3301,85 @@ APS_TEST(engine, rule_mode_monitors_and_recovers_preferred_service_group) {
     }
 }
 
+APS_TEST(engine, preferred_service_can_select_existing_nested_region_without_editing_child) {
+    for (const bool manual : {false, true}) {
+        MockClashApi api;
+        api.mode = "rule";
+        api.groups = {{"Service route", {"US relay", "Shared route"}},
+                      {"Shared route", {"Automatic route", "JP relay"}},
+                      {"Automatic route", {"SG IEPL", "JP relay"}}};
+        api.groupTypes["Automatic route"] = "URLTest";
+        api.groupSelections = {{"Service route", "US relay"},
+                               {"Shared route", "Automatic route"},
+                               {"Automatic route", "SG IEPL"}};
+        api.rulePolicies = {"Service route", "Shared route"};
+        api.latencies = {{"US relay", 100}, {"SG IEPL", 80}, {"JP relay", 20}};
+        EXPECT_TRUE(api.start());
+        Harness h;
+        auto c = h.makeConfig();
+        c.rules.clear();
+        c.proxy.clashApi.host = "127.0.0.1";
+        c.proxy.clashApi.port = api.port();
+        c.nodeMonitor.enabled = true;
+        c.nodeMonitor.regions = {"SG"};
+        c.nodeMonitor.nodeClasses = {"IEPL", "GROUP:Service route"};
+        c.nodeMonitor.intervalS = 30;
+        h.start(c);
+        if (manual) h.engine->requestNodeSwitchRound("__default__", true, "nested-choice");
+        EXPECT_TRUE(h.waitStatus([](const std::string& text) {
+            auto row = outletStatusFor(text, "__default__");
+            return row.find("group") && row.find("group")->asString() == "Service route" &&
+                   row.find("node") && row.find("node")->asString() == "SG IEPL" &&
+                   row.find("switching") && !row.find("switching")->asBool();
+        }, 5000));
+        h.stop();
+        const auto switches = api.switches();
+        EXPECT_EQ(switches.size(), 1u);
+        if (!switches.empty()) EXPECT_STREQ(switches.front(), "Service%20route::Shared route");
+        EXPECT_STREQ(api.groupSelections["Shared route"], "Automatic route");
+        EXPECT_STREQ(api.groupSelections["Automatic route"], "SG IEPL");
+        api.stop();
+    }
+}
+
+APS_TEST(engine, preferred_nested_choices_skip_invalid_unselected_and_current_leaves) {
+    for (const bool currentInRegion : {false, true}) {
+        MockClashApi api;
+        api.mode = "rule";
+        const std::string current = currentInRegion ? "SG IEPL" : "US relay";
+        api.groups = {{"Service route", {current, "Shared route", "SG cycle", "SG direct", "SG empty"}},
+                      {"Shared route", {"SG IEPL", "JP relay"}},
+                      {"SG cycle", {"Service route"}},
+                      {"SG direct", {"DIRECT"}}, {"SG empty", {"SG IEPL"}}};
+        const std::string shared = currentInRegion ? "SG IEPL" : "JP relay";
+        api.groupSelections = {{"Service route", current}, {"Shared route", shared},
+                               {"SG cycle", "Service route"}, {"SG direct", "DIRECT"}, {"SG empty", ""}};
+        api.rulePolicies = {"Service route"};
+        api.latencies = {{current, 50}, {"SG IEPL", 1}, {"JP relay", 5}, {"DIRECT", 1}};
+        EXPECT_TRUE(api.start());
+        Harness h;
+        auto c = h.makeConfig();
+        c.rules.clear();
+        c.proxy.clashApi.host = "127.0.0.1";
+        c.proxy.clashApi.port = api.port();
+        c.nodeMonitor.enabled = true;
+        c.nodeMonitor.regions = {"SG"};
+        c.nodeMonitor.nodeClasses = {"IEPL", "GROUP:Service route"};
+        c.nodeMonitor.intervalS = 30;
+        h.start(c);
+        h.engine->requestNodeSwitchRound("__default__", true, "invalid-nested");
+        EXPECT_TRUE(h.waitStatus([](const std::string& text) {
+            const auto row = outletStatusFor(text, "__default__");
+            return row.find("test_request_id") && row.find("test_request_id")->asString() == "invalid-nested" &&
+                   row.find("switching") && !row.find("switching")->asBool();
+        }, 5000));
+        h.stop();
+        EXPECT_TRUE(api.switches().empty());
+        EXPECT_STREQ(api.groupSelections["Shared route"], shared);
+        api.stop();
+    }
+}
+
 APS_TEST(engine, group_absent_class_is_inert) {
     // A wanted "GROUP:<name>" that THIS controller does not expose at all is
     // unsatisfiable (measured: GROUP:AI服务 selected globally while the

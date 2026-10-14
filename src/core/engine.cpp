@@ -2200,6 +2200,17 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
         return;
     }
     for (const auto& g : allGroups) st.groupNodes[g.name] = g.nodes;
+    const bool allowNestedChoices = st.runtimeMode == "rule" &&
+        std::find(preferredGroups.begin(), preferredGroups.end(), group->name) != preferredGroups.end();
+    auto concreteChoice = [&](const std::string& member) -> std::optional<std::string> {
+        if (isPseudoNodeName(member)) return std::nullopt;
+        const bool nested = st.groupNodes.count(member) != 0;
+        if (nested && !allowNestedChoices) return std::nullopt;
+        const auto leaf = group->memberLeaves.find(member);
+        const auto& node = leaf == group->memberLeaves.end() ? member : leaf->second;
+        if (st.groupNodes.count(node) || isPseudoNodeName(node)) return std::nullopt;
+        return node;
+    };
     // AUTO-INFER region from group names: a group whose own name carries a
     // region signal (e.g. "香港节点") teaches that region to every member
     // node — including transitively referenced sub-groups. Opaque node
@@ -2335,8 +2346,9 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
             !region::matchesAny(regionOfNode(st.node), wantRegions)) {
             bool anyInRegion = false;
             for (const auto& n : group->nodes) {
-                if (st.groupNodes.count(n) || isPseudoNodeName(n)) continue;
-                if (region::matchesAny(regionOfNode(n), wantRegions)) {
+                const auto leaf = concreteChoice(n);
+                if (!leaf) continue;
+                if (region::matchesAny(regionOfNode(*leaf), wantRegions)) {
                     anyInRegion = true;
                     break;
                 }
@@ -2428,9 +2440,8 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
         if (!st.classUnavailable && !classMatches(st.node)) {
             bool anyInClass = false;
             for (const auto& n : group->nodes) {
-                if (st.groupNodes.count(n)) continue;      // sub-group
-                if (isPseudoNodeName(n)) continue;         // DIRECT et al.
-                if (classMatches(n)) { anyInClass = true; break; }
+                const auto leaf = concreteChoice(n);
+                if (leaf && classMatches(*leaf)) { anyInClass = true; break; }
             }
             if (!anyInClass) {
                 st.classUnavailable = true;
@@ -2549,6 +2560,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     // entries).
     const int probeTimeout = std::min(nm.delayTimeoutMs, 2000);
     struct ProbeResult {
+        std::string selection; // legal immediate member used by PUT
         std::string node;
         int latency;
         std::string region;  // detected region ("" = unknown)
@@ -2563,23 +2575,21 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     auto collectCandidates = [&](bool ignoreCooldowns) {
         candidates.clear();
         cooldownSkipped = false;
+        std::set<std::string> seen{group->now};
         for (const auto& n : group->nodes) {
-            if (n == group->now) continue;
-            // Group NAMES may appear inside a selector's member list (measured:
-            // xmrth's GLOBAL lists 🍎苹果服务/🔰国外流量 alongside nodes). A
-            // group is a FILTER dimension, never a selectable node — skipping
-            // them here stops the engine from "switching" to a group name.
-            if (st.groupNodes.count(n)) continue;
-            // Built-in pseudo-proxies (DIRECT...) never count as candidates.
-            if (isPseudoNodeName(n)) continue;
+            const auto leaf = concreteChoice(n);
+            if (!leaf || !seen.insert(*leaf).second) continue;
+            // Explicit rule-service selectors may legally select a child
+            // branch at its existing leaf. General/global groups keep their
+            // previous concrete-node policy; child selections stay untouched.
             // An explicit filtered test must not silently pick a node from
             // another region/type. Timed recovery keeps its soft fallback.
-            if (manualRound && (!region::matchesAny(regionOfNode(n), wantRegions) || !classMatches(n))) continue;
+            if (manualRound && (!region::matchesAny(regionOfNode(*leaf), wantRegions) || !classMatches(*leaf))) continue;
             // A node that failed the post-switch real-CONNECT verification
             // is excluded for its cooldown (the retry loop then walks the
             // rest of the list instead of re-picking it).
             if (!ignoreCooldowns &&
-                nodeInBadCooldown(outletId, n, nowMs())) {
+                nodeInBadCooldown(outletId, *leaf, nowMs())) {
                 cooldownSkipped = true;
                 continue;
             }
@@ -2605,14 +2615,17 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
             while (true) {
                 size_t i = next.fetch_add(1);
                 if (i >= candidates.size()) break;
-                int lat = client.nodeDelay(candidates[i], nm.delayUrl,
+                const auto leaf = concreteChoice(candidates[i]);
+                if (!leaf) continue;
+                int lat = client.nodeDelay(*leaf, nm.delayUrl,
                                            probeTimeout, probeTimeout);
                 ProbeResult pr;
-                pr.node = candidates[i];
+                pr.selection = candidates[i];
+                pr.node = *leaf;
                 pr.latency = lat;
-                pr.region = regionOfNode(candidates[i]);
-                pr.inClass = classMatches(candidates[i]);
-                auto history = group->history.find(candidates[i]);
+                pr.region = regionOfNode(pr.node);
+                pr.inClass = classMatches(pr.node);
+                auto history = group->history.find(pr.node);
                 if (history != group->history.end()) {
                     pr.historySuccesses = history->second.successes;
                     pr.historySamples = history->second.samples;
@@ -2627,6 +2640,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     if (manualRound && !dead && !realFail && st.latencyMs >= 0 &&
         region::matchesAny(regionOfNode(st.node), wantRegions) && classMatches(st.node)) {
         ProbeResult current;
+        current.selection = group->selectedMember;
         current.node = st.node;
         current.latency = st.latencyMs;
         current.region = regionOfNode(st.node);
@@ -2750,7 +2764,20 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     }
     st.switching = false;  // the round ends with this store
     std::string swErr;
-    if (client.switchNode(group->name, chosen->node, &swErr)) {
+    if (client.switchNode(group->name, chosen->selection, &swErr)) {
+        if (chosen->selection != chosen->node) {
+            std::string currentMode;
+            const auto verified = client.currentSelectorGroup(&swErr, 3000, nullptr,
+                                                              &currentMode, preferredGroups);
+            if (!verified || verified->name != group->name || currentMode != "rule" ||
+                verified->now != chosen->node) {
+                st.selectionSatisfied = false;
+                st.lastSwitchDetail = "嵌套策略选择在探测期间改变，实际出口待下一轮核对";
+                log::wf("node monitor [{}]: nested member {} changed during selection verification",
+                        outletId, chosen->selection);
+                return;
+            }
+        }
         st.lastSwitchDetail = group->now + " -> " + chosen->node + " (" +
                               std::to_string(chosen->latency) + "ms)";
         if (outOfRegion && !dead && !tooSlow) {

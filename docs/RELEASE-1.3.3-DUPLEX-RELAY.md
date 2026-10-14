@@ -19,7 +19,7 @@
 空闲响应和截断响应的边界检查继续保留。
 
 这些检查证明本地缺陷及修复行为，不证明外部代理或服务端的长连接恢复。
-域名策略承接 [1.3.2 配置方法](RELEASE-1.3.2-TLS-CACHED-DNS.md)。安装前仍需
+域名策略承接 [1.3.2 配置方法](https://github.com/ltmroberthk915/AppProxySwitch/blob/main/docs/RELEASE-1.3.2-TLS-CACHED-DNS.md)。安装前仍需
 正常停止截流并从托盘退出；现有连接需要在新版启动后重新建立。
 
 手工诊断目标 `aps_relay_probe` 默认不构建、不打包，也不注册自动联网测试。

@@ -3,12 +3,24 @@
 Windows 按应用网络路由管理工具。将指定程序的 TCP 连接转发到本地 SOCKS5
 出口，支持独立规则、多出口、内核自动发现和活动连接查看。
 
-当前版本：**1.3.1**。
+当前版本：**1.3.2**。
 
 ## 下载
 
-在 [1.3.1 发布页](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.1)
+在 [1.3.2 发布页](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.2)
 下载 Windows x64 安装包或便携包。升级前正常停止引擎并从托盘退出程序。
+
+## 1.3.2 更新
+
+- 增加默认空的 `routing.tls_domain_allowlist`：明确列出的 TLS 域名即使没有
+  APS DNS 名称/地址关联，也能按 SOCKS DOMAIN 访问，避免沿用错误的缓存 IP。
+- 保留原选中出口、端口、TLS 原字节和半关闭行为；名单外名称继续沿用原规则。
+- 提供追加/清空名单的配置命令，通过产品的原子配置保存，保留其他路由、
+  节点偏好和加密凭据；命令不会启动引擎。
+- 日志记录名称转发或退回 IP 的理由，仅记录连接元数据。
+
+配置步骤与边界：[版本说明](docs/RELEASE-1.3.2-TLS-CACHED-DNS.md)。
+验证记录：[1.3.2 验证](docs/VALIDATION-1.3.2.md)。
 
 ## 1.3.1 更新
 

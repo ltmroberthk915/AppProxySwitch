@@ -619,7 +619,8 @@ APS_TEST(relay, tcp_dns_bridge_falls_back_to_exact_original_resolver) {
 
 namespace {
 void checkTlsRelay(const std::vector<uint8_t>& bytes, bool permitName,
-                   bool expectDomain, bool fragmented = false, bool enabled = true) {
+                   bool expectDomain, bool fragmented = false, bool enabled = true,
+                   const std::vector<std::string>& domainPolicy = {}) {
     MockSocks5Server proxy, unusedDefault;
     proxy.setBehavior(aps::test::MockSocksBehavior::EchoConnect);
     unusedDefault.setBehavior(aps::test::MockSocksBehavior::AcceptConnect);
@@ -638,6 +639,7 @@ void checkTlsRelay(const std::vector<uint8_t>& bytes, bool permitName,
         t.proxy = proxy.endpoint();      // must not fall back to default/Sakura
         t.outletId = "selected-verge-fixture";
         t.sink = sink;
+        t.tlsDomainAllowlist = domainPolicy;
         if (enabled) t.allowTlsDomain = [&](const std::string& name) {
             ++lookups;
             return permitName && name == "api.example.invalid";
@@ -696,6 +698,18 @@ APS_TEST(relay, no_sni_and_non_tls_keep_ip_and_original_payload) {
 }
 APS_TEST(relay, disabled_domain_recovery_preserves_existing_behavior) {
     checkTlsRelay(aps::test::tlsHello("api.example.invalid"), true, false, false, false);
+}
+APS_TEST(relay, configured_domain_recovers_cached_ip_without_observed_dns) {
+    checkTlsRelay(aps::test::tlsHello("api.example.invalid"), false, true,
+                  true, false, {"*.example.invalid"});
+}
+APS_TEST(relay, configured_domain_policy_rejects_ech_cover_and_unlisted_names) {
+    checkTlsRelay(aps::test::tlsHello("cover.other.invalid", true), false, false,
+                  false, false, {"api.example.invalid"});
+    checkTlsRelay(aps::test::tlsHello("api.example.invalid"), false, false,
+                  false, false, {"api.example.invalid.attacker.invalid"});
+    checkTlsRelay(aps::test::tlsHello(""), false, false,
+                  false, false, {"*.example.invalid"});
 }
 APS_TEST(relay, incomplete_tls_prefix_falls_back_without_waiting_forever) {
     // No EOF here: an app may stall mid-hello. The bounded inspect window

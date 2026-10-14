@@ -370,6 +370,7 @@ bool Engine::start(const Config& cfg, std::string* err) {
                             } else {
                                 const auto current = runtime();
                                 if (current) {
+                                    t.tlsDomainAllowlist = current->cfg.routing.tlsDomainAllowlist;
                                     t.allowTlsDomain = [this, ip = entry->origDstIp](const std::string& name) {
                                         std::lock_guard<std::mutex> lk(dnsCacheMu_);
                                         return dns::nameHasAddress(dnsCache_, name, ip, nowMs()) ||

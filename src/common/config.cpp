@@ -4,6 +4,7 @@
 #include <shlobj.h>
 
 #include <iterator>
+#include <string_view>
 
 #include "aps/dpapi.hpp"
 #include "aps/path_util.hpp"
@@ -87,7 +88,43 @@ void noteUnknownKeys(const json::Value& obj, const char* ctx,
     }
 }
 
+bool validTlsDomain(std::string_view name) {
+    if (name.empty() || name.size() > 253 || name.find('.') == std::string_view::npos) return false;
+    size_t label = 0;
+    bool numeric = true;
+    for (size_t i = 0; i < name.size(); ++i) {
+        const char c = name[i];
+        if (c == '.') {
+            if (label == 0 || name[i - 1] == '-') return false;
+            label = 0;
+            continue;
+        }
+        const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        const bool digit = c >= '0' && c <= '9';
+        if (!alpha && !digit && c != '-') return false;
+        if (label == 0 && c == '-') return false;
+        if (++label > 63) return false;
+        if (!digit) numeric = false;
+    }
+    return label != 0 && name.back() != '-' && !numeric;
+}
+
 }  // namespace
+
+bool tlsDomainAllowed(const std::string& name, const std::vector<std::string>& patterns) {
+    if (!validTlsDomain(name)) return false;
+    const auto host = toLowerAscii(name);
+    for (const auto& pattern : patterns) {
+        const bool wildcard = pattern.starts_with("*.");
+        const auto suffix = toLowerAscii(wildcard ? pattern.substr(2) : pattern);
+        if (!validTlsDomain(suffix)) continue;
+        if (!wildcard && host == suffix) return true;
+        // The separator is part of the comparison: badexample.com must
+        // never match *.example.com. A wildcard excludes its bare apex.
+        if (wildcard && host.size() > suffix.size() + 1 && host.ends_with("." + suffix)) return true;
+    }
+    return false;
+}
 
 Config Config::makeDefault() {
     return Config{};
@@ -216,6 +253,9 @@ json::Value Config::toJson() const {
     json::Value dnsArr = json::Value::makeArray();
     for (const auto& s : routing.dnsServers) dnsArr.append(s);
     ro.set("dns_servers", std::move(dnsArr));
+    auto tlsArr = json::Value::makeArray();
+    for (const auto& s : routing.tlsDomainAllowlist) tlsArr.append(s);
+    ro.set("tls_domain_allowlist", std::move(tlsArr));
     root.set("routing", std::move(ro));
 
     root.set("fail_mode", failMode);
@@ -373,6 +413,7 @@ bool Config::fromJson(const json::Value& v, Config& out, std::string* error,
         static const char* kN[] = {"enabled", "interval_s", "fail_threshold",
                                    "delay_url", "delay_timeout_ms",
                                    "max_latency_ms", "regions", "node_classes",
+                                   "region", "node_class",
                                    "min_switch_interval_s", "real_fail_threshold",
                                    "real_fail_ratio_pct", "real_fail_window_s",
                                    "bad_node_cooldown_s"};
@@ -481,7 +522,7 @@ bool Config::fromJson(const json::Value& v, Config& out, std::string* error,
         if (!ro->isObject()) { if (error) *error = "'routing' must be an object"; return false; }
         static const char* kRo[] = {"bypass_loopback", "bypass_private", "block_udp_for_rules",
                                     "block_ipv6_for_rules", "dns_cleanup", "dns_cleanup_global", "ipv6_enabled",
-                                    "auto_outlet_id", "cover_app_dir_always", "dns_servers"};
+                                    "auto_outlet_id", "cover_app_dir_always", "dns_servers", "tls_domain_allowlist"};
         noteUnknownKeys(*ro, "routing", kRo, std::size(kRo), warnings);
         if (!getBool(*ro, "bypass_loopback", out.routing.bypassLoopback, error)) return false;
         if (!getBool(*ro, "bypass_private", out.routing.bypassPrivate, error)) return false;
@@ -492,6 +533,7 @@ bool Config::fromJson(const json::Value& v, Config& out, std::string* error,
         if (!getBool(*ro, "ipv6_enabled", out.routing.ipv6Enabled, error)) return false;
         if (!getStr(*ro, "auto_outlet_id", out.routing.autoOutletId, error)) return false;
         if (!getBool(*ro, "cover_app_dir_always", out.routing.coverAppDirAlways, error)) return false;
+        if (!getStrArray(*ro, "tls_domain_allowlist", out.routing.tlsDomainAllowlist, error)) return false;
         const json::Value* dnsArr = ro->find("dns_servers");
         if (dnsArr) {
             out.routing.dnsServers.clear();  // explicit array replaces the default
@@ -575,6 +617,17 @@ bool Config::fromJson(const json::Value& v, Config& out, std::string* error,
 }
 
 bool Config::validate(std::string* error) const {
+    if (routing.tlsDomainAllowlist.size() > 64) {
+        if (error) *error = "routing.tls_domain_allowlist exceeds 64 entries";
+        return false;
+    }
+    for (const auto& pattern : routing.tlsDomainAllowlist) {
+        const auto name = pattern.starts_with("*.") ? pattern.substr(2) : pattern;
+        if (!validTlsDomain(name)) {
+            if (error) *error = "routing.tls_domain_allowlist requires exact domains or *.domain patterns";
+            return false;
+        }
+    }
     auto ip = parseIpv4(proxy.host);
     if (!ip) {
         if (error) *error = "proxy.host is not a valid IPv4 address";

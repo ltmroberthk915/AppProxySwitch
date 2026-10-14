@@ -10,6 +10,7 @@
 #include "aps/net.hpp"
 #include "aps/kernel_discovery.hpp"
 #include "aps/json.hpp"
+#include "aps/config.hpp"
 #include "aps/string_util.hpp"
 #include "aps/verge_official.hpp"
 #include <thread>
@@ -26,7 +27,9 @@ void printUsage() {
                 "  AppProxySwitch.exe                 启动图形界面\n"
                 "  AppProxySwitch.exe --engine        以引擎模式运行(需管理员,由 GUI 自动拉起)\n"
                 "  AppProxySwitch.exe --engine --config <path>  指定配置文件\n"
-                "  AppProxySwitch.exe --discover      只读发现诊断(JSON，无密钥，不启动引擎)\n",
+                "  AppProxySwitch.exe --discover      只读发现诊断(JSON，无密钥，不启动引擎)\n"
+                "  AppProxySwitch.exe --tls-domain-allow <domain> [--tls-domain-allow <*.domain>] [--config <path>]\n"
+                "  AppProxySwitch.exe --clear-tls-domain-allowlist [--config <path>]\n",
                 APS_VERSION);
 }
 
@@ -55,6 +58,64 @@ int main() {
     aps::net::initWinsock();
     auto args = commandArgs();
     std::wstring configPath;
+    // Explicit config operation, parsed before GUI/engine startup. It never
+    // starts interception, changes outlets, or closes existing connections.
+    bool setTlsDomains = false;
+    bool clearTlsDomains = false;
+    std::vector<std::string> tlsDomains;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == L"--config" && i + 1 < args.size()) configPath = args[++i];
+        else if (args[i] == L"--tls-domain-allow") {
+            if (i + 1 == args.size() || args[i + 1].starts_with(L"--")) return 2;
+            setTlsDomains = true;
+            tlsDomains.push_back(aps::wideToUtf8(args[++i]));
+        } else if (args[i] == L"--clear-tls-domain-allowlist") { setTlsDomains = true; clearTlsDomains = true; }
+    }
+    if (setTlsDomains) {
+        if (clearTlsDomains && !tlsDomains.empty()) return 2;
+        // Refuse ambiguous invocations, including a simultaneous engine
+        // launch, rather than silently treating them as settings changes.
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (args[i] == L"--config" || args[i] == L"--tls-domain-allow") {
+                if (i + 1 == args.size() || args[i + 1].starts_with(L"--")) return 2;
+                ++i; continue;
+            }
+            if (args[i] != L"--clear-tls-domain-allowlist") return 2;
+        }
+        if (configPath.empty()) configPath = aps::defaultConfigPath();
+        wchar_t fullPath[32768];
+        const DWORD fullLength = GetFullPathNameW(configPath.c_str(), 32768, fullPath, nullptr);
+        if (!fullLength || fullLength >= 32768) return 2;
+        configPath.assign(fullPath, fullLength);
+        if (aps::toLowerAsciiW(configPath) == aps::toLowerAsciiW(aps::defaultConfigPath())) {
+            // The GUI keeps a configuration copy. Writing its file while
+            // that copy is live would let a later GUI save erase this policy.
+            HANDLE gui = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\AppProxySwitchGui");
+            if (gui) {
+                CloseHandle(gui);
+                std::fprintf(stderr, "Exit the APS GUI normally before updating its TLS domain policy.\n");
+                return 3;
+            }
+        }
+        // A typo in --config must not manufacture a fresh configuration.
+        if (GetFileAttributesW(configPath.c_str()) == INVALID_FILE_ATTRIBUTES) return 2;
+        aps::Config cfg;
+        std::string error;
+        std::vector<std::string> warnings;
+        bool wasDefault = false;
+        if (!aps::loadConfigFile(configPath, cfg, &error, &warnings, &wasDefault) || wasDefault || !warnings.empty()) return 2;
+        if (clearTlsDomains) cfg.routing.tlsDomainAllowlist.clear();
+        for (const auto& domain : tlsDomains) {
+            bool present = false;
+            for (const auto& old : cfg.routing.tlsDomainAllowlist)
+                if (aps::equalsIgnoreCase(old, domain)) { present = true; break; }
+            if (!present) cfg.routing.tlsDomainAllowlist.push_back(domain);
+        }
+        if (!cfg.validate(&error)) { std::fprintf(stderr, "%s\n", error.c_str()); return 2; }
+        if (!aps::saveConfigFile(configPath, cfg, &error)) return 1;
+        std::printf("TLS domain policy saved: %zu entries; applies to new proxy connections.\n", cfg.routing.tlsDomainAllowlist.size());
+        return 0;
+    }
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == L"--verify-verge-refresh" && i+2 < args.size()) {
             // Explicit acceptance path, same production implementation, no

@@ -2242,6 +2242,53 @@ APS_TEST(engine, pipe_dns_answer_is_correlated_with_tls_and_selected_domain_outl
     saveKernelCache({});
 }
 
+APS_TEST(engine, explicit_tls_policy_recovers_unobserved_cached_ip_on_selected_outlet) {
+    for (bool allowed : {false, true}) {
+        MockSocks5Server selected;
+        selected.setBehavior(MockSocksBehavior::EchoConnect);
+        EXPECT_TRUE(selected.start());
+        Harness h;
+        auto c = h.makeConfig();
+        Outlet outlet;
+        outlet.id = "selected-policy";
+        outlet.host = "127.0.0.1";
+        outlet.port = selected.port();
+        c.outlets.push_back(outlet);
+        c.routing.autoOutletId = outlet.id;
+        if (allowed) c.routing.tlsDomainAllowlist = {"*.example.invalid"};
+        h.start(c);
+        SOCKET client = net::makeTcpSocket();
+        auto local = net::toSockaddr({0x7F000001, 0});
+        EXPECT_EQ(bind(client, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+        int length = sizeof(local);
+        getsockname(client, reinterpret_cast<sockaddr*>(&local), &length);
+        const auto port = ntohs(local.sin_port);
+        h.pushConnectEvent(port, 100, 0xC0000201, 8443);
+        h.device->pushTcp(buildTcpPacket(kAppIp, port, 0xC0000201, 8443, 1, 0, 0x02));
+        for (int i = 0; i < 100 && !h.engine->nat().findByPort(port); ++i) Sleep(10);
+        EXPECT_TRUE(h.engine->nat().findByPort(port) != nullptr);
+        EXPECT_EQ(net::connectWithTimeout(client, {0x7F000001, h.engine->relay().listenPort()}, 2000, nullptr), 0);
+        const auto hello = aps::test::tlsHello("cached.example.invalid", true);
+        EXPECT_EQ(net::sendAll(client, reinterpret_cast<const char*>(hello.data()), hello.size(), 2000), 0);
+        shutdown(client, SD_SEND);
+        std::vector<uint8_t> reply(hello.size());
+        EXPECT_EQ(net::recvExact(client, reinterpret_cast<char*>(reply.data()), reply.size(), 3000), static_cast<int>(reply.size()));
+        EXPECT_TRUE(reply == hello);
+        int requests = 0;
+        for (size_t i = 0; i < selected.requestCount(); ++i) {
+            const auto request = selected.request(i);
+            if (request.dstPort != 8443) continue;
+            ++requests;
+            EXPECT_EQ(request.addressType, allowed ? 3 : 1);
+            EXPECT_STREQ(request.dstDomain, allowed ? "cached.example.invalid" : "");
+            if (!allowed) EXPECT_EQ(request.dstIp, 0xC0000201u);
+        }
+        EXPECT_EQ(requests, 1);
+        net::closeSocket(client);
+        h.stop();
+    }
+}
+
 APS_TEST(engine, pipe_core_port_conflict_keeps_row_and_cannot_be_activated) {
     auto k = makeKernel("unknown-core.exe", 0, 0);
     k.apiPipe = "\\\\.\\pipe\\test-core";

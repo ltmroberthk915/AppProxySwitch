@@ -35,6 +35,49 @@ APS_TEST(config, defaults_are_valid) {
     EXPECT_STREQ(c.failMode, "open");
     EXPECT_TRUE(c.routing.bypassPrivate);
     EXPECT_TRUE(c.routing.blockUdpForRules);
+    EXPECT_TRUE(c.routing.tlsDomainAllowlist.empty());
+}
+
+APS_TEST(config, tls_domain_policy_roundtrips_and_rejects_broad_or_malformed_patterns) {
+    Config c;
+    c.routing.tlsDomainAllowlist = {"Example.Invalid", "*.example.invalid"};
+    Config parsed;
+    std::string error;
+    EXPECT_TRUE(Config::fromJson(c.toJson(), parsed, &error, nullptr));
+    EXPECT_TRUE(parsed.routing.tlsDomainAllowlist == c.routing.tlsDomainAllowlist);
+    for (const std::string invalid : {"*", "com", "*.com", "127.0.0.1", "https://example.invalid", "x.*.invalid", "a..invalid", "-a.invalid", "a.invalid."}) {
+        c.routing.tlsDomainAllowlist = {invalid};
+        EXPECT_FALSE(c.validate(&error));
+    }
+    c.routing.tlsDomainAllowlist.assign(65, "example.invalid");
+    EXPECT_FALSE(c.validate(&error));
+    auto value = Config{}.toJson();
+    auto routing = json::Value::makeObject();
+    routing.set("tls_domain_allowlist", "example.invalid");
+    value.set("routing", std::move(routing));
+    EXPECT_FALSE(Config::fromJson(value, parsed, &error, nullptr));
+}
+
+APS_TEST(config, recognized_legacy_node_preferences_do_not_count_as_unknown_fields) {
+    json::Value value;
+    std::string error;
+    std::vector<std::string> warnings;
+    EXPECT_TRUE(json::Value::parse("{\"node_monitor\":{\"region\":\"US\",\"node_class\":\"RES\"}}", value, &error));
+    Config config;
+    EXPECT_TRUE(Config::fromJson(value, config, &error, &warnings));
+    EXPECT_TRUE(warnings.empty());
+    EXPECT_TRUE(config.nodeMonitor.regions == std::vector<std::string>{"US"});
+    EXPECT_TRUE(config.nodeMonitor.nodeClasses == std::vector<std::string>{"RES"});
+}
+
+APS_TEST(config, tls_domain_policy_matches_labels_not_suffix_lookalikes) {
+    const std::vector<std::string> names = {"apex.example.invalid", "*.service.example.invalid"};
+    EXPECT_TRUE(tlsDomainAllowed("APEX.EXAMPLE.INVALID", names));
+    EXPECT_TRUE(tlsDomainAllowed("api.service.example.invalid", names));
+    EXPECT_TRUE(tlsDomainAllowed("a.b.service.example.invalid", names));
+    for (const std::string name : {"service.example.invalid", "badservice.example.invalid", "api.service.example.invalid.attacker.invalid", "another.example.invalid", "cover.example.invalid", "127.0.0.1", "a..service.example.invalid"})
+        EXPECT_FALSE(tlsDomainAllowed(name, names));
+    EXPECT_FALSE(tlsDomainAllowed("api.example.invalid", {}));
 }
 
 APS_TEST(config, json_roundtrip) {

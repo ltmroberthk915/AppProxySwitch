@@ -67,6 +67,9 @@ struct RelayTarget {
     // original destination (e.g. the engine's observed DNS answer). Unknown
     // names, ECH cover names and non-TLS traffic keep the original IP.
     std::function<bool(const std::string&)> allowTlsDomain;
+    // Explicit user hostname policy supplements DNS correlation for cached
+    // addresses. Names outside this list still require the callback above.
+    std::vector<std::string> tlsDomainAllowlist;
     // Optional TCP-DNS bridge. When set, the relay consumes RFC 7766
     // two-byte-length-prefixed DNS messages locally. The callback returns a
     // clean response for queries it handles; false makes the relay query the

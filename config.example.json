@@ -47,7 +47,8 @@
     "ipv6_enabled": false,
     "auto_outlet_id": "",
     "cover_app_dir_always": true,
-    "dns_servers": []
+    "dns_servers": [],
+    "tls_domain_allowlist": []
   },
   "node_monitor": {
     "enabled": true,

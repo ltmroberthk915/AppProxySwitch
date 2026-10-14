@@ -32,6 +32,10 @@ aps_add_test(test_subscription unit)
 add_test(NAME test_business_diagnostic
     COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/test_business_diagnostic.ps1")
 set_tests_properties(test_business_diagnostic PROPERTIES LABELS "unit")
+add_test(NAME test_tls_policy_cli
+    COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/test_tls_policy_cli.ps1"
+    -Executable "$<TARGET_FILE:AppProxySwitch>")
+set_tests_properties(test_tls_policy_cli PROPERTIES LABELS "integration")
 
 aps_add_test(test_socks5 integration)
 aps_add_test(test_relay_integration integration)

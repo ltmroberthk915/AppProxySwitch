@@ -4,13 +4,26 @@ Per-application network routing for Windows. Route selected applications' TCP
 connections through a local SOCKS5 endpoint, with independent rules, multiple
 outlets, automatic core discovery, and an active connections view.
 
-Current version: **1.3.1**.
+Current version: **1.3.2**.
 
 ## Downloads
 
-The [1.3.1 release](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.1)
+The [1.3.2 release](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.2)
 provides a Windows x64 installer and a portable ZIP. Stop the engine and exit
 from the tray before upgrading.
+
+## 1.3.2 changes
+
+- Explicit, default-empty TLS hostname allowlist recovers cached DNS addresses
+  APS did not observe. Listed names use SOCKS DOMAIN; other names retain their
+  DNS-correlation requirement.
+- Selected outlets, TLS bytes and half-close behavior are preserved.
+- Atomic configuration commands append or clear names without starting the
+  engine or changing node preferences and encrypted credentials.
+- Metadata logs explain hostname authorization and fallback to the original IP.
+
+[Configuration and boundaries](docs/RELEASE-1.3.2-TLS-CACHED-DNS.md).
+[Validation](docs/VALIDATION-1.3.2.md).
 
 ## Changes in 1.3.1
 

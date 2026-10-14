@@ -134,7 +134,14 @@ struct RoutingSettings {
     // in the user's own config). Entries are "ip" or "ip:port" (port
     // defaults to 53).
     std::vector<std::string> dnsServers;
+    // Explicit hostname policy for proxy-rule TLS sessions whose DNS answer
+    // was cached before the engine started or was never observable. Empty
+    // preserves DNS-correlation-only behavior. Exact names and *.suffix
+    // patterns authorize SOCKS DOMAIN forwarding, never TLS decryption.
+    std::vector<std::string> tlsDomainAllowlist;
 };
+
+bool tlsDomainAllowed(const std::string& name, const std::vector<std::string>& patterns);
 
 struct LoggingSettings {
     std::string level = "info";       // debug|info|warn|error

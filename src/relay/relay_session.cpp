@@ -1,6 +1,7 @@
 #include "aps/relay_server.hpp"
 
 #include "aps/log.hpp"
+#include "aps/config.hpp"
 #include "aps/path_util.hpp"
 #include "aps/socks5_client.hpp"
 #include "aps/tls_client_hello.hpp"
@@ -271,7 +272,10 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
     std::string pass = target_.proxy.port != 0 ? target_.password : params_.password;
     std::vector<uint8_t> prefix;
     std::string tlsDomain;
-    if (target_.allowTlsDomain) {
+    std::string tlsName;
+    const char* domainPolicy = "disabled";
+    if (target_.allowTlsDomain || !target_.tlsDomainAllowlist.empty()) {
+        domainPolicy = "incomplete-or-timeout";
         // TCP has already been accepted: TLS clients can send ClientHello
         // before the upstream tunnel is established. Buffer only its prefix
         // and replay it byte-for-byte after CONNECT. Never wait indefinitely
@@ -291,12 +295,23 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
             const auto hello = tls::inspectClientHello(prefix.data(), prefix.size());
             if (hello.state == tls::HelloState::NeedMore) continue;
             if (hello.state == tls::HelloState::Name) {
+                tlsName = hello.name;
+                domainPolicy = "name-not-authorized";
                 try {
-                    if (target_.allowTlsDomain(hello.name)) tlsDomain = hello.name;
+                    if (tlsDomainAllowed(hello.name, target_.tlsDomainAllowlist)) {
+                        tlsDomain = hello.name;
+                        domainPolicy = "configured-name";
+                    } else if (target_.allowTlsDomain && target_.allowTlsDomain(hello.name)) {
+                        tlsDomain = hello.name;
+                        domainPolicy = "observed-dns";
+                    }
                 } catch (...) {
                     // A failed correlation must not terminate the session
                     // thread or change the original destination.
+                    domainPolicy = "authorization-error";
                 }
+            } else {
+                domainPolicy = "no-visible-name";
             }
             break;
         }
@@ -306,6 +321,9 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         return;
     }
     Socks5FailureKind socksFailure = Socks5FailureKind::None;
+    log::ifmt("relay flow={} domain_policy={} tls_name={} original={}:{}; "
+              "TLS/HTTP not checked", id_, domainPolicy,
+              tlsName.empty() ? "none" : tlsName, formatIpv4(target_.origDst.ip), target_.origDst.port);
     const bool connected = tlsDomain.empty()
         ? Socks5Client::connect(proxy, user, pass, target_.origDst,
                                 params_.connectTimeoutMs, socks, &err, &socksFailure)
@@ -340,12 +358,13 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
     int localLen = sizeof(local);
     const bool hasLocal = getsockname(socksSock_, reinterpret_cast<sockaddr*>(&local), &localLen) == 0;
     log::ifmt("relay flow={} SOCKS5 CONNECT accepted proxy={}:{} source={}:{} "
-              "address_type={} target={}:{}; TLS/HTTP not checked", id_,
+              "address_type={} target={}:{} domain_policy={} tls_name={}; TLS/HTTP not checked", id_,
               formatIpv4(proxy.ip), proxy.port,
               hasLocal ? formatIpv4(ntohl(local.sin_addr.s_addr)) : "unknown",
               hasLocal ? ntohs(local.sin_port) : 0,
               tlsDomain.empty() ? "IPv4" : "DOMAIN",
-              tlsDomain.empty() ? formatIpv4(target_.origDst.ip) : tlsDomain, target_.origDst.port);
+              tlsDomain.empty() ? formatIpv4(target_.origDst.ip) : tlsDomain, target_.origDst.port,
+              domainPolicy, tlsName.empty() ? "none" : tlsName);
     net::enableKeepalive(socksSock_);
     if (!tlsDomain.empty()) {
         log::ifmt("relay flow={}: TLS domain preserved via '{}' -> {}:{} (SOCKS5 DOMAIN)",

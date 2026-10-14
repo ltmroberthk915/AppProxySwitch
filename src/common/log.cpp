@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <atomic>
 #include <mutex>
 
 #include "aps/path_util.hpp"
@@ -15,7 +16,7 @@ namespace {
 struct LogState {
     std::mutex mu;
     HANDLE file = INVALID_HANDLE_VALUE;
-    Level level = Level::Info;
+    std::atomic<Level> level{Level::Info};
     int maxFileMb = 10;
     int maxFiles = 5;
     std::wstring dir;
@@ -50,9 +51,7 @@ std::wstring logFilePath(const std::wstring& dir, const std::wstring& name) {
 }
 
 HANDLE openFile(const std::wstring& path) {
-    // FILE_SHARE_WRITE is required: the GUI and the engine both log to the
-    // same file; without it whichever process opens second silently loses
-    // its log sink.
+    // Permit live readers; GUI and engine use separate base names.
     return CreateFileW(path.c_str(), FILE_APPEND_DATA,
                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
                        FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -88,7 +87,7 @@ bool init(const std::wstring& dir, Level level, int maxFileMb, int maxFiles,
     if (!ensureDirectory(dir)) return false;
     s.dir = dir;
     s.base = baseName ? baseName : L"aps";
-    s.level = level;
+    s.level.store(level, std::memory_order_relaxed);
     s.maxFileMb = maxFileMb > 0 ? maxFileMb : 10;
     s.maxFiles = maxFiles > 0 ? maxFiles : 5;
     s.file = openFile(logFilePath(dir, s.base + L".log"));
@@ -104,16 +103,16 @@ void shutdown() {
 }
 
 void setLevel(Level level) {
-    state().level = level;
+    state().level.store(level, std::memory_order_relaxed);
 }
 
 Level level() {
-    return state().level;
+    return state().level.load(std::memory_order_relaxed);
 }
 
 void write(Level level, std::string_view msg) {
     auto& s = state();
-    if (level < s.level) return;
+    if (level < s.level.load(std::memory_order_relaxed)) return;
     std::string utf8 = std::format("{} [{}] {}\r\n", formatLocalTime(nowMs()),
                                    levelTag(level), msg);
     std::lock_guard<std::mutex> lk(s.mu);

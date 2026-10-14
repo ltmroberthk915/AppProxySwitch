@@ -3808,10 +3808,15 @@ void Engine::handleTcpPacket(uint8_t* buf, size_t len, const PacketMeta& meta) {
         device_->sendLastTcp(buf, len, false);
         return;
     }
-    log::df("pkt {}:{} -> {}:{} syn={} ack={} fin={} rst={} len={} lb={} if={}",
-            formatIpv4(p.srcIp), p.srcPort, formatIpv4(p.dstIp), p.dstPort, p.syn ? 1 : 0,
-            p.ackFlag ? 1 : 0, p.fin ? 1 : 0, p.rst ? 1 : 0, p.payloadLen,
-            meta.loopback ? 1 : 0, meta.ifIdx);
+    // Data/ACK packets can arrive faster than the rotating log can retain
+    // critical flow outcomes. Keep control transitions, while byte counters
+    // cover ordinary traffic without synchronously logging every packet.
+    if (p.syn || p.fin || p.rst) {
+        log::df("pkt {}:{} -> {}:{} syn={} ack={} fin={} rst={} len={} lb={} if={}",
+                formatIpv4(p.srcIp), p.srcPort, formatIpv4(p.dstIp), p.dstPort, p.syn ? 1 : 0,
+                p.ackFlag ? 1 : 0, p.fin ? 1 : 0, p.rst ? 1 : 0, p.payloadLen,
+                meta.loopback ? 1 : 0, meta.ifIdx);
+    }
     int64_t now = nowMs();
 
     // Defensive 127/8 exclusion: the kernel filter only excludes the exact

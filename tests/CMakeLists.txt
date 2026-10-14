@@ -4,6 +4,15 @@
 #   windivert    - real driver, requires admin (SKIP when not elevated)
 set(APS_TESTS_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Manually invoked diagnostic, excluded from normal builds and test runs.
+# Uses the production RelaySession without opening a WinDivert handle.
+add_executable(aps_relay_probe EXCLUDE_FROM_ALL aps_relay_probe.cpp)
+target_link_libraries(aps_relay_probe PRIVATE appsw_core)
+aps_set_warnings(aps_relay_probe)
+add_custom_command(TARGET aps_relay_probe POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${APS_WINDIVERT_ROOT}/bin/x64/WinDivert.dll" "$<TARGET_FILE_DIR:aps_relay_probe>")
+
 function(aps_add_test name labels)
   add_executable(${name} ${name}.cpp)
   target_link_libraries(${name} PRIVATE appsw_core)
@@ -18,6 +27,7 @@ function(aps_add_test name labels)
 endfunction()
 
 aps_add_test(test_json unit)
+aps_add_test(test_log unit)
 aps_add_test(test_config unit)
 aps_add_test(test_crypt unit)
 aps_add_test(test_socket_map unit)

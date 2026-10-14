@@ -15,6 +15,7 @@ namespace aps {
 
 namespace {
 constexpr size_t kPumpBuf = 64 * 1024;
+static_assert(tls::kMaxClientHelloBytes <= kPumpBuf);
 }  // namespace
 
 RelaySession::RelaySession(uint64_t id, SOCKET appSock, net::Endpoint4 appPeer,
@@ -213,6 +214,11 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
     };
     const char* firstEof = "none";
     int64_t firstEofMs = -1;
+    const net::Endpoint4 proxy = target_.proxy.port != 0 ? target_.proxy : params_.proxy;
+    net::Endpoint4 proxySource{};
+    std::string tlsDomain, tlsName;
+    const char* domainPolicy = "disabled";
+    const char* addressType = "unconnected";
     auto noteEof = [&](const char* side) {
         // shutdown() from abort() can wake recv as EOF too. Keep that
         // teardown distinct from a peer's observed orderly close.
@@ -221,9 +227,15 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
             firstEof = side;
             firstEofMs = elapsedMs();
         }
-        log::ifmt("relay flow={} eof_side={} first_eof={} at_ms={} up={} down={}; "
+        log::ifmt("relay flow={} eof_side={} first_eof={} at_ms={} up={} down={} "
+                  "engine_pid={} pid={} source={}:{} destination={}:{} outlet={} "
+                  "proxy_source={}:{} address_type={} target={}; "
                   "peer EOF does not verify HTTP/WSS completion", id_, side,
-                  firstEof, elapsedMs(), bytesUp_.load(), bytesDown_.load());
+                  firstEof, elapsedMs(), bytesUp_.load(), bytesDown_.load(), GetCurrentProcessId(),
+                  target_.originalPid, formatIpv4(target_.origSource.ip), target_.origSource.port,
+                  formatIpv4(target_.origDst.ip), target_.origDst.port, target_.outletId,
+                  formatIpv4(proxySource.ip), proxySource.port, addressType,
+                  tlsDomain.empty() ? formatIpv4(target_.origDst.ip) : tlsDomain);
     };
     log::ifmt("relay flow={} pid={} source={}:{} peer={}:{} destination={}:{} outlet={}",
               id_, target_.originalPid, formatIpv4(target_.origSource.ip), target_.origSource.port,
@@ -246,8 +258,16 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         }
         log::ifmt("relay flow={} tcp_completed={} application_completion=unverified "
                   "failure={} first_eof={} first_eof_ms={} duration_ms={} "
-                  "up={} down={} detail={}", id_, ok, relayFailureKindName(failureKind),
-                  firstEof, firstEofMs, elapsedMs(), bytesUp_.load(), bytesDown_.load(), error_);
+                  "up={} down={} detail={} engine_pid={} pid={} source={}:{} "
+                  "destination={}:{} outlet={} proxy={}:{} proxy_source={}:{} "
+                  "address_type={} target={} domain_policy={} tls_name={}",
+                  id_, ok, relayFailureKindName(failureKind), firstEof, firstEofMs,
+                  elapsedMs(), bytesUp_.load(), bytesDown_.load(), error_, GetCurrentProcessId(),
+                  target_.originalPid, formatIpv4(target_.origSource.ip), target_.origSource.port,
+                  formatIpv4(target_.origDst.ip), target_.origDst.port, target_.outletId,
+                  formatIpv4(proxy.ip), proxy.port, formatIpv4(proxySource.ip), proxySource.port,
+                  addressType, tlsDomain.empty() ? formatIpv4(target_.origDst.ip) : tlsDomain,
+                  domainPolicy, tlsName.empty() ? "none" : tlsName);
         net::closeSocket(socksSock_);
         net::closeSocket(appSock_);
         if (target_.sink) target_.sink->onClosed();
@@ -267,13 +287,9 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
     std::string err;
     SOCKET socks = INVALID_SOCKET;
     // The per-rule outlet overrides the server defaults (multi-egress).
-    net::Endpoint4 proxy = target_.proxy.port != 0 ? target_.proxy : params_.proxy;
     std::string user = target_.proxy.port != 0 ? target_.username : params_.username;
     std::string pass = target_.proxy.port != 0 ? target_.password : params_.password;
     std::vector<uint8_t> prefix;
-    std::string tlsDomain;
-    std::string tlsName;
-    const char* domainPolicy = "disabled";
     if (target_.allowTlsDomain || !target_.tlsDomainAllowlist.empty()) {
         domainPolicy = "incomplete-or-timeout";
         // TCP has already been accepted: TLS clients can send ClientHello
@@ -357,6 +373,8 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
     sockaddr_in local{};
     int localLen = sizeof(local);
     const bool hasLocal = getsockname(socksSock_, reinterpret_cast<sockaddr*>(&local), &localLen) == 0;
+    if (hasLocal) proxySource = {ntohl(local.sin_addr.s_addr), ntohs(local.sin_port)};
+    addressType = tlsDomain.empty() ? "IPv4" : "DOMAIN";
     log::ifmt("relay flow={} SOCKS5 CONNECT accepted proxy={}:{} source={}:{} "
               "address_type={} target={}:{} domain_policy={} tls_name={}; TLS/HTTP not checked", id_,
               formatIpv4(proxy.ip), proxy.port,
@@ -370,29 +388,97 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         log::ifmt("relay flow={}: TLS domain preserved via '{}' -> {}:{} (SOCKS5 DOMAIN)",
                   id_, target_.outletId, tlsDomain, target_.origDst.port);
     }
-    if (!prefix.empty()) {
-        if (net::sendAll(socksSock_, reinterpret_cast<const char*>(prefix.data()),
-                         prefix.size(), params_.pumpTimeoutMs) != 0) {
-            finish(false, RelayFailureKind::Tunnel, "SOCKS5 prefix send: " + net::lastError());
-            return;
-        }
-        bytesUp_.fetch_add(prefix.size());
-        if (target_.sink) target_.sink->onBytes(prefix.size(), 0);
+    // A slow reader in one direction must not block traffic in the other.
+    // select() followed by a blocking sendAll() can still block inside send
+    // after its socket buffer fills, starving the opposite side indefinitely.
+    u_long nonblocking = 1;
+    if (ioctlsocket(appSock_, FIONBIO, &nonblocking) != 0 ||
+        ioctlsocket(socksSock_, FIONBIO, &nonblocking) != 0) {
+        finish(false, RelayFailureKind::Internal, "nonblocking pump: " + net::lastError());
+        return;
     }
-
     bool appEof = false;    // app finished sending
     bool socksEof = false;  // proxy finished sending
-    std::vector<char> buf(kPumpBuf);
+    struct Pending {
+        std::vector<char> data = std::vector<char>(kPumpBuf);
+        size_t begin = 0, end = 0;
+        std::chrono::steady_clock::time_point progress{};
+        bool empty() const { return begin == end; }
+    } up, down;
+    if (!prefix.empty()) {
+        std::copy(prefix.begin(), prefix.end(), up.data.begin());
+        up.end = prefix.size();
+        up.progress = std::chrono::steady_clock::now();
+    }
+    std::vector<uint8_t>().swap(prefix);
+    const auto sendBudget = std::chrono::milliseconds(std::max(1, params_.pumpTimeoutMs));
+
+    auto readInto = [&](SOCKET socket, Pending& pending, bool& eof,
+                        SOCKET opposite, const char* side, RelayFailureKind failure) {
+        const int r = recv(socket, pending.data.data(), static_cast<int>(pending.data.size()), 0);
+        if (r == 0) {
+            eof = true;
+            noteEof(side);
+            // Reads are enabled only when this direction's buffer is empty,
+            // so every queued byte has been forwarded before propagating FIN.
+            shutdown(opposite, SD_SEND);
+        } else if (r == SOCKET_ERROR) {
+            if (WSAGetLastError() == WSAEWOULDBLOCK) return true;
+            finish(false, failure, std::string(side) + " recv: " + net::lastError());
+            return false;
+        } else {
+            pending.begin = 0;
+            pending.end = static_cast<size_t>(r);
+            pending.progress = std::chrono::steady_clock::now();
+        }
+        return true;
+    };
+    auto writeFrom = [&](SOCKET socket, Pending& pending, bool uploading,
+                         const char* side, RelayFailureKind failure) {
+        const int w = send(socket, pending.data.data() + pending.begin,
+                           static_cast<int>(pending.end - pending.begin), 0);
+        if (w == SOCKET_ERROR) {
+            if (WSAGetLastError() == WSAEWOULDBLOCK) return true;
+            finish(false, failure, std::string(side) + " send: " + net::lastError());
+            return false;
+        }
+        if (w > 0) {
+            pending.begin += static_cast<size_t>(w);
+            pending.progress = std::chrono::steady_clock::now();
+            if (uploading) bytesUp_.fetch_add(static_cast<uint64_t>(w));
+            else bytesDown_.fetch_add(static_cast<uint64_t>(w));
+            if (target_.sink) target_.sink->onBytes(uploading ? w : 0, uploading ? 0 : w);
+        }
+        return true;
+    };
 
     while (!abortFlag_.load()) {
         if (appEof && socksEof) break;
-
-        fd_set rset;
+        const auto now = std::chrono::steady_clock::now();
+        if ((!up.empty() && now - up.progress >= sendBudget) ||
+            (!down.empty() && now - down.progress >= sendBudget)) {
+            const bool blockedUp = !up.empty() && now - up.progress >= sendBudget;
+            finish(false, blockedUp ? RelayFailureKind::Tunnel : RelayFailureKind::Application,
+                   blockedUp ? "socks send timed out" : "app send timed out");
+            return;
+        }
+        int waitMs = 1000;
+        for (const Pending* pending : {&up, &down}) {
+            if (!pending->empty()) {
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    sendBudget - (now - pending->progress)).count();
+                waitMs = std::min(waitMs, static_cast<int>(std::max<int64_t>(1, remaining)));
+            }
+        }
+        fd_set rset, wset;
         FD_ZERO(&rset);
-        if (!appEof) FD_SET(appSock_, &rset);
-        if (!socksEof) FD_SET(socksSock_, &rset);
-        timeval tv{1, 0};
-        int n = select(0, &rset, nullptr, nullptr, &tv);
+        FD_ZERO(&wset);
+        if (!appEof && up.empty()) FD_SET(appSock_, &rset);
+        if (!socksEof && down.empty()) FD_SET(socksSock_, &rset);
+        if (!up.empty()) FD_SET(socksSock_, &wset);
+        if (!down.empty()) FD_SET(appSock_, &wset);
+        timeval tv{waitMs / 1000, (waitMs % 1000) * 1000};
+        int n = select(0, &rset, &wset, nullptr, &tv);
         if (n < 0) {
             finish(false, RelayFailureKind::Internal,
                    "select failed: " + net::lastError());
@@ -400,48 +486,18 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         }
         if (n == 0) continue;  // tick: re-check abort flag
 
-        // app -> proxy
+        // Read and write each direction independently; each queue is bounded
+        // to one chunk. Idle streams have no send deadline.
         if (!appEof && FD_ISSET(appSock_, &rset)) {
-            int r = ::recv(appSock_, buf.data(), static_cast<int>(buf.size()), 0);
-            if (r == 0) {
-                appEof = true;
-                noteEof("application");
-                shutdown(socksSock_, SD_SEND);
-            } else if (r == SOCKET_ERROR) {
-                finish(false, RelayFailureKind::Application,
-                       "app recv: " + net::lastError());
-                return;
-            } else if (net::sendAll(socksSock_, buf.data(), static_cast<size_t>(r),
-                                    params_.pumpTimeoutMs) != 0) {
-                finish(false, RelayFailureKind::Tunnel,
-                       "socks send: " + net::lastError());
-                return;
-            } else {
-                bytesUp_.fetch_add(static_cast<uint64_t>(r));
-                if (target_.sink) target_.sink->onBytes(static_cast<uint64_t>(r), 0);
-            }
+            if (!readInto(appSock_, up, appEof, socksSock_, "application", RelayFailureKind::Application)) return;
         }
-        // proxy -> app
         if (!socksEof && FD_ISSET(socksSock_, &rset)) {
-            int r = ::recv(socksSock_, buf.data(), static_cast<int>(buf.size()), 0);
-            if (r == 0) {
-                socksEof = true;
-                noteEof("proxy");
-                shutdown(appSock_, SD_SEND);
-            } else if (r == SOCKET_ERROR) {
-                finish(false, RelayFailureKind::Tunnel,
-                       "socks recv: " + net::lastError());
-                return;
-            } else if (net::sendAll(appSock_, buf.data(), static_cast<size_t>(r),
-                                    params_.pumpTimeoutMs) != 0) {
-                finish(false, RelayFailureKind::Application,
-                       "app send: " + net::lastError());
-                return;
-            } else {
-                bytesDown_.fetch_add(static_cast<uint64_t>(r));
-                if (target_.sink) target_.sink->onBytes(0, static_cast<uint64_t>(r));
-            }
+            if (!readInto(socksSock_, down, socksEof, appSock_, "proxy", RelayFailureKind::Tunnel)) return;
         }
+        if (!up.empty() && FD_ISSET(socksSock_, &wset) &&
+            !writeFrom(socksSock_, up, true, "socks", RelayFailureKind::Tunnel)) return;
+        if (!down.empty() && FD_ISSET(appSock_, &wset) &&
+            !writeFrom(appSock_, down, false, "app", RelayFailureKind::Application)) return;
     }
     const bool aborted = abortFlag_.load();
     finish(!aborted, aborted ? RelayFailureKind::Aborted

@@ -2138,6 +2138,37 @@ static void checkDefaultControllerAlias(bool usePipe) {
     log::shutdown();
 }
 
+APS_TEST(engine, packet_flood_preserves_flow_evidence_and_reinjects_every_packet) {
+    TempSakuraDir diagnostic("");
+    EXPECT_TRUE(log::init(diagnostic.base, log::Level::Debug, 1, 1));
+    Harness h;
+    auto c = h.makeConfig();
+    c.logging.level = "debug";
+    c.routing.dnsCleanup = false;
+    h.start(c);
+    log::ifmt("critical-flow-evidence-marker");
+    // Pass-through loopback fixtures isolate logging from rule/NAT behavior.
+    // Previously these ACK/data records rotated away the critical marker.
+    constexpr size_t packets = 15000;
+    const std::vector<uint8_t> payload(16, 0x71);
+    for (size_t i = 0; i < packets; ++i) {
+        h.device->pushTcp(buildTcpPacket(0x7F000001, 52000, 0x7F000001, 443,
+                                         static_cast<uint32_t>(i), 1, 0x10, payload));
+    }
+    h.device->pushTcp(buildTcpPacket(0x7F000001, 52000, 0x7F000001, 443, 15000, 1, 0x11));
+    EXPECT_TRUE(h.device->waitSent(packets + 1, 10000));
+    EXPECT_EQ(h.device->sent().size(), packets + 1);
+    h.stop();
+    log::shutdown();
+    std::ifstream trace(diagnostic.base + L"\\aps.log");
+    std::ostringstream text;
+    text << trace.rdbuf();
+    const auto lines = text.str();
+    EXPECT_TRUE(lines.find("critical-flow-evidence-marker") != std::string::npos);
+    EXPECT_TRUE(lines.find("fin=1") != std::string::npos);
+    EXPECT_TRUE(lines.size() < 65536);
+}
+
 APS_TEST(engine, node_monitor_deduplicates_default_alias_of_active_kernel) {
     checkDefaultControllerAlias(false);
 }

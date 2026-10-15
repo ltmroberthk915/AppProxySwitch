@@ -220,18 +220,6 @@ RelayParams Engine::outletParams(const std::string& id) const {
     return it->second;
 }
 
-net::Endpoint4 Engine::outletEndpoint(const std::string& id) const {
-    return outletParams(id).proxy;
-}
-
-std::string Engine::outletUsername(const std::string& id) const {
-    return outletParams(id).username;
-}
-
-std::string Engine::outletPassword(const std::string& id) const {
-    return outletParams(id).password;
-}
-
 bool Engine::outletHealthy(const std::string& id) const {
     std::string key = outletEnabled(id) ? id : std::string(kDefaultOutletId);
     std::lock_guard<std::mutex> lk(const_cast<Engine*>(this)->healthMu_);
@@ -351,9 +339,12 @@ bool Engine::start(const Config& cfg, std::string* err) {
                            t.origDst = net::Endpoint4{entry->origDstIp, entry->origDstPort};
                            t.origSource = net::Endpoint4{entry->appIp, entry->appPort};
                            t.originalPid = entry->pid;
-                           t.proxy = outletEndpoint(entry->outletId);
-                           t.username = outletUsername(entry->outletId);
-                           t.password = outletPassword(entry->outletId);
+                           // A discovery/config reload may publish another
+                           // outlet table between individual field reads.
+                           const auto outlet = outletParams(entry->outletId);
+                           t.proxy = outlet.proxy;
+                           t.username = outlet.username;
+                           t.password = outlet.password;
                             t.ruleId = entry->ruleId;
                             t.outletId = entry->outletId;
                             t.sink = entry;
@@ -1939,13 +1930,12 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
                 "the verdict", outletId, formatIpv4(ip), port);
         return VerifyOutcome::NoVerdict;
     }
-    net::Endpoint4 proxy = outletEndpoint(outletId);
-    if (proxy.port == 0) return VerifyOutcome::NoVerdict;
+    const auto outlet = outletParams(outletId);
+    if (outlet.proxy.port == 0) return VerifyOutcome::NoVerdict;
     std::string err;
     SOCKET s = INVALID_SOCKET;
     const int timeoutMs = std::min(cfg.nodeMonitor.delayTimeoutMs, 3000);
-    if (!Socks5Client::connect(proxy, outletUsername(outletId),
-                               outletPassword(outletId),
+    if (!Socks5Client::connect(outlet.proxy, outlet.username, outlet.password,
                                net::Endpoint4{ip, port}, timeoutMs, s, &err)) {
         log::df("node monitor [{}]: verification CONNECT to {}:{} failed: {}",
                 outletId, formatIpv4(ip), port, err);
@@ -1963,7 +1953,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
                               bool manualRound) {
     if (stopping_.load()) return;  // shutdown: don't start probe work
     // Monitoring measures this row even when it is not selected for routing.
-    // outletEndpoint() applies routing fallback and would stamp an inactive
+    // outletParams() applies routing fallback and would stamp an inactive
     // kernel's result with a different kernel's address.
     net::Endpoint4 endpoint{};
     if (const auto monitored = outlets_.load()) {

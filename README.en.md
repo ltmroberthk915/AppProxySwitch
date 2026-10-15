@@ -1,10 +1,9 @@
 # AppProxySwitch
 
-The **1.3.4 candidate** lets an explicitly preferred service policy select a
-child group's existing matching leaf, preserving child selections. It also
-includes the 1.3.3 relay and diagnostic fixes. See the
-[candidate notes](docs/RELEASE-1.3.4-NESTED-CHOICES.md). Live recovery requires
-separate verification.
+The **1.3.5 candidate** fixes relay configuration snapshots, worker cleanup and
+socket cancellation races. It includes the earlier duplex and nested-selector
+changes. See [candidate notes](docs/RELEASE-1.3.5-RELAY-LIFECYCLE.md).
+Live model-stream stability still requires separate verification.
 
 Per-application network routing for Windows. Route selected applications' TCP
 connections through a local SOCKS5 endpoint, with independent rules, multiple

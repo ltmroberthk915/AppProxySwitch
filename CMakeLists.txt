@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(AppProxySwitch
-    VERSION 1.3.4
+    VERSION 1.3.5
     DESCRIPTION "AppProxySwitch - per-application SOCKS5 proxy switcher"
     LANGUAGES CXX)
 

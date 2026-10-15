@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -946,6 +947,130 @@ APS_TEST(relay, idle_client_can_be_stopped_during_tls_inspection) {
     EXPECT_EQ(relay.counters.aborted.load(), 1u);
     EXPECT_EQ(proxy.requestCount(), 0u);
     proxy.stop();
+}
+
+APS_TEST(relay, parameter_reload_keeps_endpoint_and_credentials_together) {
+    MockSocks5Server first, second;
+    first.setBehavior(aps::test::MockSocksBehavior::EchoConnect);
+    second.setBehavior(aps::test::MockSocksBehavior::EchoConnect);
+    const std::string firstUser = "first-user";
+    const std::string secondUser(120, 'u');
+    const std::string firstPass(72, 'a'), secondPass(144, 'b');
+    first.setRequireAuth(true, firstUser, firstPass);
+    second.setRequireAuth(true, secondUser, secondPass);
+    EXPECT_TRUE(first.start());
+    EXPECT_TRUE(second.start());
+    RelayParams a, b;
+    a.proxy = first.endpoint(); a.username = firstUser; a.password = firstPass;
+    b.proxy = second.endpoint(); b.username = secondUser; b.password = secondPass;
+    auto sink = std::make_shared<TestSink>();
+    RelayServer relay;
+    EXPECT_TRUE(relay.start(a, 0, [&](uint32_t, uint16_t) {
+        RelayTarget target;
+        target.origDst = {0xC0000201, 443};
+        target.sink = sink;
+        return std::optional<RelayTarget>(std::move(target));
+    }, nullptr));
+    std::jthread reloads([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            relay.updateParams(a);
+            relay.updateParams(b);
+            std::this_thread::yield();
+        }
+    });
+    constexpr unsigned count = 64;
+    for (unsigned i = 0; i < count; ++i) {
+        PreparedClient client;
+        EXPECT_TRUE(client.bind());
+        EXPECT_EQ(net::connectWithTimeout(client.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        const char payload[] = "reload-check";
+        EXPECT_EQ(net::sendAll(client.s, payload, sizeof(payload), 2000), 0);
+        shutdown(client.s, SD_SEND);
+        char reply[sizeof(payload)]{};
+        EXPECT_EQ(net::recvExact(client.s, reply, sizeof(reply), 2000), static_cast<int>(sizeof(reply)));
+        EXPECT_TRUE(std::memcmp(payload, reply, sizeof(reply)) == 0);
+        // One application at a time also keeps the auth fixture independent
+        // of its own concurrent-client bookkeeping.
+        EXPECT_TRUE(waitUntil([&] { return sink->closed.load() == i + 1; }, 2000));
+    }
+    reloads.request_stop();
+    reloads.join();
+    relay.stop();
+    EXPECT_EQ(relay.counters.completed.load(), count);
+    EXPECT_EQ(first.requestCount() + second.requestCount(), count);
+    first.stop();
+    second.stop();
+}
+
+APS_TEST(relay, stop_waits_for_all_inflight_completion_callbacks) {
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool release = false;
+    std::atomic<unsigned> entered{0}, returned{0};
+    auto sink = std::make_shared<TestSink>();
+    RelayServer relay;
+    EXPECT_TRUE(relay.start({}, 0, [&](uint32_t, uint16_t) {
+        RelayTarget target;
+        target.sink = sink;
+        target.resolveDns = [](const uint8_t*, size_t, std::vector<uint8_t>&) { return false; };
+        target.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
+                              RelayFailureKind, const std::string&) {
+            entered.fetch_add(1);
+            std::unique_lock<std::mutex> lock(mutex);
+            wake.wait(lock, [&] { return release; });
+            returned.fetch_add(1);
+        };
+        return std::optional<RelayTarget>(std::move(target));
+    }, nullptr));
+    constexpr unsigned count = 12;
+    std::vector<std::unique_ptr<PreparedClient>> clients;
+    for (unsigned i = 0; i < count; ++i) {
+        auto client = std::make_unique<PreparedClient>();
+        EXPECT_TRUE(client->bind());
+        EXPECT_EQ(net::connectWithTimeout(client->s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        shutdown(client->s, SD_SEND); // no DNS query: immediate orderly EOF
+        clients.push_back(std::move(client));
+    }
+    EXPECT_TRUE(waitUntil([&] { return entered.load() == count; }, 2000));
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] { relay.stop(); stopped.store(true); });
+    Sleep(50);
+    EXPECT_FALSE(stopped.load());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    wake.notify_all();
+    stopper.join();
+    EXPECT_TRUE(stopped.load());
+    EXPECT_EQ(returned.load(), count);
+    EXPECT_EQ(sink->closed.load(), count);
+    EXPECT_EQ(relay.activeSessions(), 0u);
+    relay.stop(); // repeated stop is harmless
+}
+
+APS_TEST(relay, immediately_closed_connections_are_reaped_before_restart) {
+    RelayServer relay;
+    auto sink = std::make_shared<TestSink>();
+    constexpr unsigned rounds = 4, perRound = 96;
+    for (unsigned round = 0; round < rounds; ++round) {
+        EXPECT_TRUE(relay.start({}, 0, [&](uint32_t, uint16_t) {
+            RelayTarget target;
+            target.sink = sink;
+            target.resolveDns = [](const uint8_t*, size_t, std::vector<uint8_t>&) { return false; };
+            return std::optional<RelayTarget>(std::move(target));
+        }, nullptr));
+        for (unsigned i = 0; i < perRound; ++i) {
+            PreparedClient client;
+            EXPECT_TRUE(client.bind());
+            EXPECT_EQ(net::connectWithTimeout(client.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+            shutdown(client.s, SD_SEND);
+        }
+        EXPECT_TRUE(waitUntil([&] { return relay.activeSessions() == 0 &&
+            sink->closed.load() == (round + 1) * perRound; }, 3000));
+        relay.stop();
+    }
+    EXPECT_EQ(sink->closed.load(), rounds * perRound);
 }
 
 APS_TEST_MAIN();

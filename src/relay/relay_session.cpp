@@ -24,8 +24,22 @@ RelaySession::RelaySession(uint64_t id, SOCKET appSock, net::Endpoint4 appPeer,
       params_(params) {}
 
 RelaySession::~RelaySession() {
+    closeSockets();
+}
+
+void RelaySession::closeSockets() {
+    std::lock_guard<std::mutex> lock(socketsMu_);
     net::closeSocket(appSock_);
     net::closeSocket(socksSock_);
+}
+
+void RelaySession::replaceProxySocket(SOCKET socket) {
+    std::lock_guard<std::mutex> lock(socketsMu_);
+    net::closeSocket(socksSock_);
+    socksSock_ = socket;
+    if (abortFlag_.load() && socksSock_ != INVALID_SOCKET) {
+        shutdown(socksSock_, SD_BOTH);
+    }
 }
 
 bool RelaySession::runDnsBridge(RelayFailureKind& failureKind,
@@ -65,8 +79,11 @@ bool RelaySession::runDnsBridge(RelayFailureKind& failureKind,
             err = "aborted";
             return false;
         }
-        net::closeSocket(socksSock_);
-        socksSock_ = net::makeTcpSocket();
+        replaceProxySocket(net::makeTcpSocket());
+        if (abortFlag_.load()) {
+            err = "aborted";
+            return false;
+        }
         if (socksSock_ == INVALID_SOCKET) {
             err = "TCP DNS fallback socket: " + net::lastError();
             return false;
@@ -113,7 +130,7 @@ bool RelaySession::runDnsBridge(RelayFailureKind& failureKind,
                                             : "TCP DNS fallback response failed";
             return false;
         }
-        net::closeSocket(socksSock_);
+        replaceProxySocket(INVALID_SOCKET);
         return true;
     };
 
@@ -202,7 +219,8 @@ bool RelaySession::runDnsBridge(RelayFailureKind& failureKind,
 void RelaySession::abort() {
     abortFlag_.store(true);
     // Unblock select() immediately on both sockets.
-    shutdown(appSock_, SD_BOTH);
+    std::lock_guard<std::mutex> lock(socketsMu_);
+    if (appSock_ != INVALID_SOCKET) shutdown(appSock_, SD_BOTH);
     if (socksSock_ != INVALID_SOCKET) shutdown(socksSock_, SD_BOTH);
 }
 
@@ -268,8 +286,7 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
                   formatIpv4(proxy.ip), proxy.port, formatIpv4(proxySource.ip), proxySource.port,
                   addressType, tlsDomain.empty() ? formatIpv4(target_.origDst.ip) : tlsDomain,
                   domainPolicy, tlsName.empty() ? "none" : tlsName);
-        net::closeSocket(socksSock_);
-        net::closeSocket(appSock_);
+        closeSockets();
         if (target_.sink) target_.sink->onClosed();
         if (onDone) onDone(*this);
     };
@@ -369,7 +386,7 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         finish(false, failureKind, err);
         return;
     }
-    socksSock_ = socks;
+    replaceProxySocket(socks);
     sockaddr_in local{};
     int localLen = sizeof(local);
     const bool hasLocal = getsockname(socksSock_, reinterpret_cast<sockaddr*>(&local), &localLen) == 0;

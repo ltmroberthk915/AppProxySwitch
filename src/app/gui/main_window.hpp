@@ -50,6 +50,7 @@ private:
     void stopEngineFromUi(bool confirm);
     void clearLogs();
     void exitApp();
+    void showFromUserRequest(const char* source);
     void exportConfigUi();
     void importConfigUi();
 

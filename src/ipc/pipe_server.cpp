@@ -6,6 +6,7 @@
 #include "aps/log.hpp"
 #include "aps/protocol.hpp"
 #include "aps/string_util.hpp"
+#include "pipe_io.hpp"
 
 namespace aps::ipc {
 
@@ -56,13 +57,20 @@ bool PipeServer::start(const std::wstring& name, MsgHandler onMsg, std::string* 
 void PipeServer::stop() {
     if (stopping_.exchange(true)) return;
     if (stopEvent_) SetEvent(stopEvent_);
-    if (pipe_ != INVALID_HANDLE_VALUE) {
-        CancelIoEx(pipe_, nullptr);
-        DisconnectNamedPipe(pipe_);
-        CloseHandle(pipe_);
-        pipe_ = INVALID_HANDLE_VALUE;
+    {
+        std::lock_guard<std::mutex> lk(writeMu_);
+        if (pipe_ != INVALID_HANDLE_VALUE) {
+            CancelIoEx(pipe_, nullptr);
+            DisconnectNamedPipe(pipe_);
+        }
     }
     if (thread_.joinable()) thread_.join();
+    {
+        std::lock_guard<std::mutex> lk(writeMu_);
+        if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
+        pipe_ = INVALID_HANDLE_VALUE;
+        clientConnected_.store(false);
+    }
     if (stopEvent_) CloseHandle(stopEvent_);
     stopEvent_ = nullptr;
 }
@@ -73,33 +81,38 @@ void PipeServer::acceptLoop() {
 
     while (!stopping_.load()) {
         // (Re)create the pipe instance and wait for a client.
-        if (pipe_ != INVALID_HANDLE_VALUE) {
-            DisconnectNamedPipe(pipe_);
-            CloseHandle(pipe_);
-            pipe_ = INVALID_HANDLE_VALUE;
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+        {
+            std::lock_guard<std::mutex> lk(writeMu_);
+            if (pipe_ != INVALID_HANDLE_VALUE) {
+                DisconnectNamedPipe(pipe_);
+                CloseHandle(pipe_);
+                pipe_ = INVALID_HANDLE_VALUE;
+            }
+            if (stopping_.load()) break;
+            SECURITY_ATTRIBUTES* psa = haveSa ? &sa : nullptr;
+            pipe = CreateNamedPipeW(name_.c_str(),
+                                     PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+                                         PIPE_REJECT_REMOTE_CLIENTS,
+                                     1, 64 * 1024, 64 * 1024, 0, psa);
+            pipe_ = pipe;
         }
-        SECURITY_ATTRIBUTES* psa = haveSa ? &sa : nullptr;
-        pipe_ = CreateNamedPipeW(name_.c_str(),
-                                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
-                                     PIPE_REJECT_REMOTE_CLIENTS,
-                                 1, 64 * 1024, 64 * 1024, 0, psa);
-        if (pipe_ == INVALID_HANDLE_VALUE) {
+        if (pipe == INVALID_HANDLE_VALUE) {
             log::ef("pipe: CreateNamedPipe failed ({})", GetLastError());
             if (WaitForSingleObject(stopEvent_, 1000) == WAIT_OBJECT_0) break;
             continue;
         }
         OVERLAPPED ov{};
         ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        BOOL connected = ConnectNamedPipe(pipe_, &ov);
+        if (!ov.hEvent) break;
+        BOOL connected = ConnectNamedPipe(pipe, &ov);
         DWORD err = GetLastError();
         if (!connected && err == ERROR_IO_PENDING) {
-            HANDLE waits[2] = {ov.hEvent, stopEvent_};
-            DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-            if (w == WAIT_OBJECT_0 + 1) {  // stopping
-                CancelIoEx(pipe_, nullptr);
+            DWORD ignored = 0;
+            if (!detail::awaitPending(pipe, ov, stopEvent_, INFINITE, ignored)) {
                 CloseHandle(ov.hEvent);
-                break;
+                continue;
             }
         } else if (!connected && err != ERROR_PIPE_CONNECTED) {
             CloseHandle(ov.hEvent);
@@ -110,7 +123,7 @@ void PipeServer::acceptLoop() {
 
         clientConnected_.store(true);
         log::d("pipe: client connected");
-        readLoop();
+        readLoop(pipe);
         clientConnected_.store(false);
         log::d("pipe: client disconnected");
     }
@@ -119,23 +132,17 @@ void PipeServer::acceptLoop() {
     }
 }
 
-void PipeServer::readLoop() {
+void PipeServer::readLoop(HANDLE pipe) {
     std::string pending;
     char buf[8192];
     OVERLAPPED rov{};
     rov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    while (!stopping_.load()) {
+    while (rov.hEvent && !stopping_.load() && clientConnected_.load()) {
         DWORD got = 0;
         ResetEvent(rov.hEvent);
-        BOOL ok = ReadFile(pipe_, buf, sizeof(buf), &got, &rov);
+        BOOL ok = ReadFile(pipe, buf, sizeof(buf), &got, &rov);
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            HANDLE waits[2] = {rov.hEvent, stopEvent_};
-            DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-            if (w == WAIT_OBJECT_0 + 1) {
-                CancelIoEx(pipe_, nullptr);
-                break;
-            }
-            ok = GetOverlappedResult(pipe_, &rov, &got, FALSE);
+            ok = detail::awaitPending(pipe, rov, stopEvent_, INFINITE, got);
         }
         if (!ok || got == 0) break;  // disconnected
         pending.append(buf, got);
@@ -164,25 +171,25 @@ void PipeServer::readLoop() {
         if (start > 0) pending.erase(0, start);
         if (pending.size() > kMaxLine) pending.clear();  // garbage guard
     }
-    CloseHandle(rov.hEvent);
+    if (rov.hEvent) CloseHandle(rov.hEvent);
 }
 
 bool PipeServer::sendLine(const std::string& line) {
-    if (pipe_ == INVALID_HANDLE_VALUE || !clientConnected_.load()) return false;
+    if (stopping_.load() || !clientConnected_.load()) return false;
     std::lock_guard<std::mutex> lk(writeMu_);
+    if (stopping_.load() || !clientConnected_.load() || pipe_ == INVALID_HANDLE_VALUE) return false;
     std::string data = line;
     if (data.empty() || data.back() != '\n') data.push_back('\n');
     if (data.size() > kMaxLine) return false;
-    OVERLAPPED wov{};
-    wov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    DWORD written = 0;
-    BOOL ok = WriteFile(pipe_, data.data(), static_cast<DWORD>(data.size()), &written,
-                        &wov);
-    if (!ok && GetLastError() == ERROR_IO_PENDING) {
-        ok = GetOverlappedResult(pipe_, &wov, &written, TRUE);
+    if (!detail::writeBounded(pipe_, stopEvent_, data)) {
+        // Only the GUI control channel is reset. The engine and relay flows
+        // remain running; partial JSON must never leak into a later command.
+        clientConnected_.store(false);
+        CancelIoEx(pipe_, nullptr);
+        DisconnectNamedPipe(pipe_);
+        return false;
     }
-    CloseHandle(wov.hEvent);
-    return ok && written == data.size();
+    return true;
 }
 
 }  // namespace aps::ipc

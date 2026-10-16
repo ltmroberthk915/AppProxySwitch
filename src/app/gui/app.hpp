@@ -34,5 +34,6 @@ constexpr UINT WM_APP_TRAY = WM_APP + 1;      // lParam = tray event
 constexpr UINT WM_APP_PIPE_MSG = WM_APP + 2;  // wParam = pointer to json::Value string (heap)
 constexpr UINT WM_APP_PIPE_STATE = WM_APP + 3;  // wParam = 1 connected / 0 disconnected
 constexpr UINT WM_APP_PROXY_TEST = WM_APP + 4; // lParam = pointer to result string (heap)
+constexpr UINT WM_APP_SHOW = WM_APP + 5;     // request handled on the UI thread
 
 }  // namespace aps::gui

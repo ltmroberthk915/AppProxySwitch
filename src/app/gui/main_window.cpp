@@ -415,10 +415,11 @@ void MainWindow::buildUi() {
 }
 
 void MainWindow::layout(int w, int h) {
-    if (!rules_.hwnd() || layingOut_ || w <= 0 || h <= 0) return;
+    if (!rules_.hwnd() || layingOut_ || IsIconic(hwnd_) || w <= 0 || h <= 0) return;
     layingOut_ = true;
-    const bool repaint = IsWindowVisible(hwnd_) != FALSE;
-    if (repaint) SendMessageW(hwnd_, WM_SETREDRAW, FALSE, 0);
+    // DefWindowProc's WM_SETREDRAW removes/re-adds WS_VISIBLE. Doing that to
+    // the top-level taskbar window on every background status push changes
+    // shell-visible state. Child ListViews already batch their own redraws.
     // The node pane scrolls independently; long results and extra kernels
     // cannot compress either ListView or overlap the notice below it.
     const int viewW = w;
@@ -500,7 +501,6 @@ void MainWindow::layout(int w, int h) {
                      0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     layingOut_ = false;
-    if (repaint) SendMessageW(hwnd_, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(hwnd_, nullptr, nullptr,
                  RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
@@ -865,7 +865,7 @@ void MainWindow::clearLogs() {
     log::shutdown();
     log::clear();
     log::init(dir + L"\\logs", log::Level::Info, cfg_.cfg.logging.maxFileMb,
-              cfg_.cfg.logging.maxFiles);
+              cfg_.cfg.logging.maxFiles, L"aps-gui");
 }
 
 void MainWindow::exportConfigUi() {
@@ -934,19 +934,23 @@ void MainWindow::exitApp() {
     DestroyWindow(hwnd_);
 }
 
+void MainWindow::showFromUserRequest(const char* source) {
+    log::ifmt("gui show requested: source={} visible={} minimized={}", source,
+              IsWindowVisible(hwnd_) != FALSE, IsIconic(hwnd_) != FALSE);
+    ShowWindow(hwnd_, SW_RESTORE);
+    SetForegroundWindow(hwnd_);
+    updateStatsVisibility();
+}
+
 void MainWindow::onTrayEvent(LPARAM lParam) {
     if (lParam == WM_LBUTTONDBLCLK) {
-        ShowWindow(hwnd_, SW_RESTORE);
-        SetForegroundWindow(hwnd_);
-        updateStatsVisibility();
+        showFromUserRequest("tray-double-click");
         return;
     }
     if (lParam == WM_CONTEXTMENU || lParam == WM_RBUTTONUP) {
         switch (tray_.showMenu()) {
             case 5001:  // open
-                ShowWindow(hwnd_, SW_RESTORE);
-                SetForegroundWindow(hwnd_);
-                updateStatsVisibility();
+                showFromUserRequest("tray-menu");
                 break;
             case 5002: {  // enable all rules
                 for (auto& r : cfg_.cfg.rules) r.enabled = true;
@@ -1075,7 +1079,7 @@ void MainWindow::onPipeMessage(const std::string& jsonLine) {
             // Power saving: while the window is hidden in the tray, the
             // per-second full ListView rebuild is pure waste — skip it; the
             // first tick after the window returns repopulates (<= 1s).
-            if (!IsWindowVisible(hwnd_)) {
+            if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_)) {
                 lastConnsJson_.clear();  // force a rebuild on the next visible tick
             } else if (conns->dump() == lastConnsJson_) {
                 // Identical payload: skip the expensive repopulation.
@@ -1570,7 +1574,7 @@ void MainWindow::onSpeedRowClicked(size_t rowIdx) {
     if (!engine_->sendNodeSwitch(oid, pendingTestRequestId_)) {
         pendingOutlet_.clear();
         pendingTestRequestId_.clear();
-        SetWindowTextW(nodeRows_[rowIdx].lblStatus, L"测试请求未送达，请重试");
+        SetWindowTextW(nodeRows_[rowIdx].lblStatus, L"测试请求发送未确认，请查看线路状态");
     }
 }
 
@@ -1744,7 +1748,7 @@ LRESULT MainWindow::wndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_SIZE:
-            layout(LOWORD(lp), HIWORD(lp));
+            if (wp != SIZE_MINIMIZED) layout(LOWORD(lp), HIWORD(lp));
             // Minimize/restore changes the STATS-consumer state too.
             updateStatsVisibility();
             return 0;
@@ -1754,8 +1758,14 @@ LRESULT MainWindow::wndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             scrollPage(SB_VERT, -1, -GET_WHEEL_DELTA_WPARAM(wp) * Scaled(60) / WHEEL_DELTA);
             return 0;
         case WM_SHOWWINDOW:
+            log::ifmt("gui visibility: shown={} reason={}", wp != 0, lp);
             updateStatsVisibility();   // tray hide / restore
             return 0;
+        case WM_SYSCOMMAND:
+            if ((wp & 0xfff0) == SC_RESTORE || (wp & 0xfff0) == SC_MINIMIZE)
+                log::ifmt("gui system command: restore={} minimized={}",
+                          (wp & 0xfff0) == SC_RESTORE, IsIconic(hwnd_) != FALSE);
+            return DefWindowProcW(hwnd_, msg, wp, lp);
         case WM_GETMINMAXINFO: {
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
             mmi->ptMinTrackSize.x = Scaled(540);
@@ -1866,6 +1876,10 @@ LRESULT MainWindow::wndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_APP_TRAY:
             onTrayEvent(lp);
+            return 0;
+        case WM_APP_SHOW:
+            showFromUserRequest(wp == 0 ? "second-instance-event"
+                                        : "second-instance-fallback");
             return 0;
         case WM_APP_PIPE_MSG: {
             auto* s = reinterpret_cast<std::string*>(lp);

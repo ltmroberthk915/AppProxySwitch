@@ -1,5 +1,7 @@
 #include "aps/relay_server.hpp"
 
+#include <chrono>
+
 #include "aps/log.hpp"
 #include "aps/path_util.hpp"
 
@@ -44,10 +46,12 @@ bool RelayServer::start(const RelayParams& params, uint16_t listenPort, Resolver
 
 void RelayServer::stop() {
     if (listener_ == INVALID_SOCKET) return;
+    const auto stopStarted = std::chrono::steady_clock::now();
     stopping_.store(true);
     shutdown(listener_, SD_BOTH);
     closesocket(listener_);
     if (acceptThread_.joinable()) acceptThread_.join();
+    const auto listenerStopped = std::chrono::steady_clock::now();
     listener_ = INVALID_SOCKET; // acceptLoop no longer reads this member
     listenPort_.store(0);
 
@@ -63,6 +67,10 @@ void RelayServer::stop() {
     for (auto& [id, entry] : toAbort) {
         if (entry->thread.joinable()) entry->thread.join();
     }
+    log::ifmt("relay stopped listener_wait_ms={} session_wait_ms={} sessions={}",
+        std::chrono::duration_cast<std::chrono::milliseconds>(listenerStopped-stopStarted).count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-listenerStopped).count(),
+        toAbort.size());
 }
 
 size_t RelayServer::activeSessions() const {

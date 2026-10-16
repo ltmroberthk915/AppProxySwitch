@@ -482,31 +482,43 @@ APS_TEST(relay, streaming_fin_does_not_claim_http_completion_or_cut_idle_reads) 
 }
 
 APS_TEST(relay, slow_download_reader_does_not_block_upload_control) {
-    PressureProxy proxy(true);
-    EXPECT_TRUE(proxy.start());
-    RelayParams params;
-    params.proxy = proxy.endpoint();
-    params.pumpTimeoutMs = 5000;
-    RelayServer relay;
-    EXPECT_TRUE(relay.start(params, 0, [](uint32_t, uint16_t) {
-        RelayTarget t;
-        t.origDst = {0xC0000201, 443};
-        return std::optional<RelayTarget>(t);
-    }, nullptr));
-    PreparedClient cli;
-    EXPECT_TRUE(cli.bind());
-    int small = 1024;
-    setsockopt(cli.s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&small), sizeof(small));
-    EXPECT_EQ(net::connectWithTimeout(cli.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
-    EXPECT_EQ(net::sendAll(cli.s, "INIT", 4, 2000), 0);
-    EXPECT_TRUE(waitUntil([&] { return proxy.ready.load(); }, 1500));
-    Sleep(500); // do not read the flood; the relay's download send must block
-    EXPECT_EQ(net::sendAll(cli.s, "CTRL", 4, 1000), 0);
-    EXPECT_TRUE(waitUntil([&] { return proxy.controlReceived.load(); }, 1500));
-    const auto stoppingAt = std::chrono::steady_clock::now();
-    relay.stop();
-    EXPECT_TRUE(std::chrono::steady_clock::now() - stoppingAt < std::chrono::seconds(1));
-    proxy.stop();
+    for(int round=0;round<3;++round){
+        TempRelayLog diagnostic;
+        EXPECT_TRUE(diagnostic.opened);
+        PressureProxy proxy(true);
+        EXPECT_TRUE(proxy.start());
+        RelayParams params;
+        params.proxy = proxy.endpoint();
+        params.pumpTimeoutMs = 5000;
+        RelayServer relay;
+        EXPECT_TRUE(relay.start(params, 0, [](uint32_t, uint16_t) {
+            RelayTarget t;
+            t.origDst = {0xC0000201, 443};
+            return std::optional<RelayTarget>(t);
+        }, nullptr));
+        PreparedClient cli;
+        EXPECT_TRUE(cli.bind());
+        int small = 1024;
+        setsockopt(cli.s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&small), sizeof(small));
+        EXPECT_EQ(net::connectWithTimeout(cli.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        EXPECT_EQ(net::sendAll(cli.s, "INIT", 4, 2000), 0);
+        EXPECT_TRUE(waitUntil([&] { return proxy.ready.load(); }, 1500));
+        Sleep(500); // do not read the flood; the relay's download send must block
+        EXPECT_EQ(net::sendAll(cli.s, "CTRL", 4, 1000), 0);
+        EXPECT_TRUE(waitUntil([&] { return proxy.controlReceived.load(); }, 1500));
+        const auto stoppingAt = std::chrono::steady_clock::now();
+        relay.stop();
+        const auto stopDuration = std::chrono::steady_clock::now() - stoppingAt;
+        std::printf("    slow-download stop round %d: %lldms\n",round+1,static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(stopDuration).count()));
+        EXPECT_TRUE(stopDuration < std::chrono::seconds(1));
+        const auto stopLog=diagnostic.read();
+        const auto phase=stopLog.find("relay stopped listener_wait_ms=");
+        if(phase!=std::string::npos){
+            std::printf("    %s\n",stopLog.substr(phase,stopLog.find('\n',phase)-phase).c_str());
+        }
+        proxy.stop();
+    }
 }
 
 APS_TEST(relay, stalled_send_has_bounded_deadline_and_correct_failure_side) {

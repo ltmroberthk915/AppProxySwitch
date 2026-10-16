@@ -1,4 +1,4 @@
-// Exercise the actual WM_DPICHANGED/repaint path with real child windows.
+// Exercise background refresh, show state and DPI paths with real child windows.
 // Link-time doubles below replace the IPC, config and tray object files:
 // this executable cannot contact a running engine or modify the user's data.
 #include <winsock2.h>
@@ -123,6 +123,25 @@ struct WindowFixture {
                      reinterpret_cast<LPARAM>(&suggested));
     }
 };
+
+struct VisibilityTrace {
+    HWND hwnd;
+    int visibleStyleChanges = 0;
+    explicit VisibilityTrace(HWND window) : hwnd(window) {
+        SetWindowSubclass(hwnd, observe, 1, reinterpret_cast<DWORD_PTR>(this));
+    }
+    ~VisibilityTrace() { RemoveWindowSubclass(hwnd, observe, 1); }
+    static LRESULT CALLBACK observe(HWND wnd, UINT msg, WPARAM wp, LPARAM lp,
+                                    UINT_PTR, DWORD_PTR context) {
+        auto* self = reinterpret_cast<VisibilityTrace*>(context);
+        const auto visibleBefore = GetWindowLongPtrW(wnd, GWL_STYLE) & WS_VISIBLE;
+        const auto result = DefSubclassProc(wnd, msg, wp, lp);
+        if (msg == WM_SETREDRAW &&
+            visibleBefore != (GetWindowLongPtrW(wnd, GWL_STYLE) & WS_VISIBLE))
+            ++self->visibleStyleChanges;
+        return result;
+    }
+};
 }  // namespace
 
 // All externally mutating boundaries are replaced for this test target only.
@@ -179,6 +198,76 @@ void TrayIcon::setTooltip(const wchar_t*) {}
 void TrayIcon::showBalloon(const wchar_t*, const wchar_t*) {}
 int TrayIcon::showMenu() { return 0; }
 }  // namespace aps::gui
+
+APS_TEST(mainwindow, background_layout_preserves_top_level_visibility) {
+    WindowFixture f;
+    VisibilityTrace trace(f.hwnd());
+    for (int tick = 0; tick < 5; ++tick) {
+        f.window->onPipeMessage(tick % 2 ? snapshot : manyKernelsSnapshot());
+        EXPECT_TRUE(IsWindowVisible(f.hwnd()) != FALSE);
+        EXPECT_FALSE(IsIconic(f.hwnd()) != FALSE);
+    }
+    // A repaint must not remove/re-add the taskbar window's WS_VISIBLE bit.
+    EXPECT_EQ(trace.visibleStyleChanges, 0);
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, minimized_window_stays_minimized_during_background_updates) {
+    WindowFixture f;
+    ShowWindow(f.hwnd(), SW_SHOWMINNOACTIVE);
+    EXPECT_TRUE(IsIconic(f.hwnd()) != FALSE);
+    VisibilityTrace trace(f.hwnd());
+    for (int tick = 0; tick < 5; ++tick) {
+        f.window->onPipeMessage(tick % 2 ? snapshot : manyKernelsSnapshot());
+        f.window->onPipeState(false);
+        f.window->onPipeState(true);
+        f.window->onPipeMessage(R"({"type":"STATUS","state":"RUNNING"})");
+        EXPECT_TRUE(IsWindowVisible(f.hwnd()) != FALSE);
+        EXPECT_TRUE(IsIconic(f.hwnd()) != FALSE);
+    }
+    EXPECT_EQ(trace.visibleStyleChanges, 0);
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, tray_hidden_window_stays_hidden_during_background_updates) {
+    WindowFixture f;
+    ShowWindow(f.hwnd(), SW_HIDE);
+    VisibilityTrace trace(f.hwnd());
+    for (int tick = 0; tick < 5; ++tick) {
+        f.window->onPipeMessage(tick % 2 ? snapshot : manyKernelsSnapshot());
+        f.window->onPipeState(false);
+        f.window->onPipeState(true);
+        f.dpiChanged();
+        EXPECT_FALSE(IsWindowVisible(f.hwnd()) != FALSE);
+    }
+    EXPECT_EQ(trace.visibleStyleChanges, 0);
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, explicit_show_request_restores_the_window) {
+    WindowFixture f;
+    for (int state : {SW_SHOWMINNOACTIVE, SW_HIDE}) {
+        ShowWindow(f.hwnd(), state);
+        SendMessageW(f.hwnd(), WM_APP_SHOW, 0, 0);
+        EXPECT_TRUE(IsWindowVisible(f.hwnd()) != FALSE);
+        EXPECT_FALSE(IsIconic(f.hwnd()) != FALSE);
+    }
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, minimized_connections_refresh_on_the_first_restored_snapshot) {
+    WindowFixture f;
+    HWND connections = findControl(f.hwnd(), 1002);
+    EXPECT_EQ(ListView_GetItemCount(connections), 1);
+    ShowWindow(f.hwnd(), SW_SHOWMINNOACTIVE);
+    const auto changed = manyKernelsSnapshot();
+    f.window->onPipeMessage(changed);
+    EXPECT_EQ(ListView_GetItemCount(connections), 1);
+    SendMessageW(f.hwnd(), WM_APP_SHOW, 0, 0);
+    f.window->onPipeMessage(changed); // identical to the skipped payload
+    EXPECT_EQ(ListView_GetItemCount(connections), 50);
+    EXPECT_EQ(mutations, 0);
+}
 
 APS_TEST(mainwindow, dpi_rebuild_preserves_node_rows_and_selection) {
     WindowFixture f;

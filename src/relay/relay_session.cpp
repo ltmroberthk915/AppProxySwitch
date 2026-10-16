@@ -15,6 +15,10 @@ namespace aps {
 
 namespace {
 constexpr size_t kPumpBuf = 64 * 1024;
+// Local socket shutdown does not always wake a backpressured Windows select.
+// Recheck explicit cancellation within the stop budget; idle streams do not
+// expire and the configured queued-byte send deadline remains unchanged.
+constexpr int kAbortCheckMs = 250;
 static_assert(tls::kMaxClientHelloBytes <= kPumpBuf);
 }  // namespace
 
@@ -479,7 +483,7 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
                    blockedUp ? "socks send timed out" : "app send timed out");
             return;
         }
-        int waitMs = 1000;
+        int waitMs = kAbortCheckMs;
         for (const Pending* pending : {&up, &down}) {
             if (!pending->empty()) {
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(

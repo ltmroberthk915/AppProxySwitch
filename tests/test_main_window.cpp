@@ -1,4 +1,4 @@
-// Exercise the actual WM_DPICHANGED/repaint path with real child windows.
+// Exercise background refresh, show state and DPI paths with real child windows.
 // Link-time doubles below replace the IPC, config and tray object files:
 // this executable cannot contact a running engine or modify the user's data.
 #include <winsock2.h>
@@ -6,6 +6,7 @@
 #include <commctrl.h>
 
 #include <memory>
+#include <map>
 #include <string>
 
 #include "main_window.hpp"
@@ -123,6 +124,72 @@ struct WindowFixture {
                      reinterpret_cast<LPARAM>(&suggested));
     }
 };
+
+struct VisibilityTrace {
+    HWND hwnd;
+    int visibleStyleChanges = 0;
+    explicit VisibilityTrace(HWND window) : hwnd(window) {
+        SetWindowSubclass(hwnd, observe, 1, reinterpret_cast<DWORD_PTR>(this));
+    }
+    ~VisibilityTrace() { RemoveWindowSubclass(hwnd, observe, 1); }
+    static LRESULT CALLBACK observe(HWND wnd, UINT msg, WPARAM wp, LPARAM lp,
+                                    UINT_PTR, DWORD_PTR context) {
+        auto* self = reinterpret_cast<VisibilityTrace*>(context);
+        const auto visibleBefore = GetWindowLongPtrW(wnd, GWL_STYLE) & WS_VISIBLE;
+        const auto result = DefSubclassProc(wnd, msg, wp, lp);
+        if (msg == WM_SETREDRAW &&
+            visibleBefore != (GetWindowLongPtrW(wnd, GWL_STYLE) & WS_VISIBLE))
+            ++self->visibleStyleChanges;
+        return result;
+    }
+};
+
+struct RefreshTrace {
+    HWND root;
+    std::map<HWND, RECT> rectangles;
+    int geometryChanges = 0;
+    int textWrites = 0;
+    int backgroundErases = 0;
+    int fullBackgroundErases = 0;
+    explicit RefreshTrace(HWND window) : root(window) {
+        watch(root);
+        for(HWND child=GetWindow(root,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))
+            watch(child);
+        HWND pane=findControl(root,131);
+        for(HWND child=GetWindow(pane,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))
+            watch(child);
+    }
+    void watch(HWND child) {
+        rectangles[child]=bounds(child);
+        SetWindowSubclass(child,observe,2,reinterpret_cast<DWORD_PTR>(this));
+    }
+    ~RefreshTrace() {
+        for(const auto& entry:rectangles)RemoveWindowSubclass(entry.first,observe,2);
+    }
+    static LRESULT CALLBACK observe(HWND wnd,UINT msg,WPARAM wp,LPARAM lp,
+                                    UINT_PTR,DWORD_PTR context) {
+        auto* self=reinterpret_cast<RefreshTrace*>(context);
+        if(msg==WM_WINDOWPOSCHANGED) {
+            const RECT current=bounds(wnd);
+            auto& previous=self->rectangles[wnd];
+            if(!EqualRect(&current,&previous))++self->geometryChanges;
+            previous=current;
+        }
+        if(msg==WM_SETTEXT)++self->textWrites;
+        if(msg==WM_ERASEBKGND&&wnd==self->root) {
+            ++self->backgroundErases;
+            RECT clip{},client{};
+            GetClipBox(reinterpret_cast<HDC>(wp),&clip);
+            GetClientRect(wnd,&client);
+            if(EqualRect(&clip,&client))++self->fullBackgroundErases;
+        }
+        return DefSubclassProc(wnd,msg,wp,lp);
+    }
+};
+
+void flushPaint(HWND window) {
+    RedrawWindow(window,nullptr,nullptr,RDW_UPDATENOW|RDW_ALLCHILDREN);
+}
 }  // namespace
 
 // All externally mutating boundaries are replaced for this test target only.
@@ -179,6 +246,169 @@ void TrayIcon::setTooltip(const wchar_t*) {}
 void TrayIcon::showBalloon(const wchar_t*, const wchar_t*) {}
 int TrayIcon::showMenu() { return 0; }
 }  // namespace aps::gui
+
+APS_TEST(mainwindow, background_layout_preserves_top_level_visibility) {
+    WindowFixture f;
+    VisibilityTrace trace(f.hwnd());
+    for (int tick = 0; tick < 5; ++tick) {
+        f.window->onPipeMessage(tick % 2 ? snapshot : manyKernelsSnapshot());
+        EXPECT_TRUE(IsWindowVisible(f.hwnd()) != FALSE);
+        EXPECT_FALSE(IsIconic(f.hwnd()) != FALSE);
+    }
+    // A repaint must not remove/re-add the taskbar window's WS_VISIBLE bit.
+    EXPECT_EQ(trace.visibleStyleChanges, 0);
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, live_counters_do_not_move_scrolled_controls_or_erase_whole_window) {
+    WindowFixture f;
+    aps::json::Value value;
+    aps::json::Value::parse(snapshot,value,nullptr);
+    f.window->onPipeMessage(value.dump());
+    SetWindowPos(f.hwnd(),nullptr,0,0,Scaled(740),Scaled(540),SWP_NOMOVE|SWP_NOZORDER);
+    SendMessageW(f.hwnd(),WM_HSCROLL,SB_BOTTOM,0);
+    SendMessageW(f.hwnd(),WM_VSCROLL,SB_BOTTOM,0);
+    flushPaint(f.hwnd());
+    RefreshTrace trace(f.hwnd());
+    for(int tick=0;tick<10;++tick) {
+        auto flow=value.find("connections")->at(0);
+        flow.set("bytes_down",1000+tick);
+        flow.set("duration_ms",1000*(tick+1));
+        auto connections=aps::json::Value::makeArray();
+        connections.append(flow);
+        value.set("connections",connections);
+        f.window->onPipeMessage(value.dump());
+        flushPaint(f.hwnd());
+    }
+    std::printf("    10 scrolled refreshes: moves=%d parent erases=%d full-client erases=%d\n",
+                trace.geometryChanges,trace.backgroundErases,trace.fullBackgroundErases);
+    EXPECT_EQ(trace.geometryChanges,0);
+    EXPECT_EQ(trace.backgroundErases,0);
+    wchar_t duration[64]{},download[64]{};
+    ListView_GetItemText(findControl(f.hwnd(),1002),0,4,duration,64);
+    ListView_GetItemText(findControl(f.hwnd(),1002),0,6,download,64);
+    EXPECT_TRUE(std::wstring(duration)==L"10 秒");
+    EXPECT_TRUE(std::wstring(download)==L"1009 B");
+    EXPECT_EQ(mutations,0);
+}
+
+APS_TEST(mainwindow, unchanged_node_status_has_no_placeholder_text_roundtrip) {
+    WindowFixture f;
+    const std::string noApi=R"({"type":"STATS","kernels":[{"id":"auto-test","name":"core.exe","alive":true,"seen":true,"has_api":false}],"outlets":[]})";
+    f.window->onPipeMessage(noApi);
+    flushPaint(f.hwnd());
+    RefreshTrace trace(f.hwnd());
+    for(int tick=0;tick<10;++tick) {
+        f.window->onPipeMessage(noApi);
+        flushPaint(f.hwnd());
+    }
+    std::printf("    10 unchanged node refreshes: text writes=%d moves=%d\n",
+                trace.textWrites,trace.geometryChanges);
+    EXPECT_EQ(trace.textWrites,0);
+    EXPECT_EQ(trace.geometryChanges,0);
+    EXPECT_EQ(trace.backgroundErases,0);
+    EXPECT_TRUE(hasText(f.hwnd(),L"内核运行中；节点控制器未识别"));
+    EXPECT_EQ(mutations,0);
+}
+
+APS_TEST(mainwindow, wrapped_nodes_stay_still_after_resize_dpi_and_inner_scroll) {
+    WindowFixture f;
+    aps::json::Value value;
+    aps::json::Value::parse(snapshot,value,nullptr);
+    std::string warning;
+    for(int i=0;i<16;++i)warning+="Wrapped route warning preserves the selected outlet and live connection. ";
+    auto outlet=value.find("outlets")->at(0);
+    outlet.set("routing_warning",warning);
+    for(int width:{740,1100,760}) {
+        auto outlets=aps::json::Value::makeArray();outlets.append(outlet);
+        value.set("outlets",outlets);
+        f.window->onPipeMessage(value.dump());
+        SetWindowPos(f.hwnd(),nullptr,0,0,Scaled(width),Scaled(540),SWP_NOMOVE|SWP_NOZORDER);
+        SendMessageW(f.hwnd(),WM_VSCROLL,SB_BOTTOM,0);
+        SendMessageW(f.hwnd(),WM_HSCROLL,SB_BOTTOM,0);
+        HWND pane=findControl(f.hwnd(),131);
+        SendMessageW(pane,WM_VSCROLL,SB_BOTTOM,0);
+        SCROLLINFO before{sizeof(before),SIF_POS};GetScrollInfo(pane,SB_VERT,&before);
+        EXPECT_GT(before.nPos,0);
+        flushPaint(f.hwnd());
+        {
+            RefreshTrace trace(f.hwnd());
+            for(int tick=0;tick<10;++tick) {
+                auto changed=outlet;changed.set("latency_ms",100+tick);
+                auto fresh=aps::json::Value::makeArray();fresh.append(changed);
+                value.set("outlets",fresh);
+                f.window->onPipeMessage(value.dump());
+                flushPaint(f.hwnd());
+            }
+            std::printf("    width %d: moves=%d full-client erases=%d\n",
+                        width,trace.geometryChanges,trace.fullBackgroundErases);
+            EXPECT_EQ(trace.geometryChanges,0);
+            EXPECT_EQ(trace.fullBackgroundErases,0);
+            EXPECT_TRUE(hasText(f.hwnd(),L"Test node  109ms"));
+        }
+        SCROLLINFO after{sizeof(after),SIF_POS};GetScrollInfo(pane,SB_VERT,&after);
+        EXPECT_EQ(after.nPos,before.nPos);
+        f.dpiChanged();
+    }
+    EXPECT_EQ(mutations,0);
+}
+
+APS_TEST(mainwindow, minimized_window_stays_minimized_during_background_updates) {
+    WindowFixture f;
+    ShowWindow(f.hwnd(), SW_SHOWMINNOACTIVE);
+    EXPECT_TRUE(IsIconic(f.hwnd()) != FALSE);
+    VisibilityTrace trace(f.hwnd());
+    for (int tick = 0; tick < 5; ++tick) {
+        f.window->onPipeMessage(tick % 2 ? snapshot : manyKernelsSnapshot());
+        f.window->onPipeState(false);
+        f.window->onPipeState(true);
+        f.window->onPipeMessage(R"({"type":"STATUS","state":"RUNNING"})");
+        EXPECT_TRUE(IsWindowVisible(f.hwnd()) != FALSE);
+        EXPECT_TRUE(IsIconic(f.hwnd()) != FALSE);
+    }
+    EXPECT_EQ(trace.visibleStyleChanges, 0);
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, tray_hidden_window_stays_hidden_during_background_updates) {
+    WindowFixture f;
+    ShowWindow(f.hwnd(), SW_HIDE);
+    VisibilityTrace trace(f.hwnd());
+    for (int tick = 0; tick < 5; ++tick) {
+        f.window->onPipeMessage(tick % 2 ? snapshot : manyKernelsSnapshot());
+        f.window->onPipeState(false);
+        f.window->onPipeState(true);
+        f.dpiChanged();
+        EXPECT_FALSE(IsWindowVisible(f.hwnd()) != FALSE);
+    }
+    EXPECT_EQ(trace.visibleStyleChanges, 0);
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, explicit_show_request_restores_the_window) {
+    WindowFixture f;
+    for (int state : {SW_SHOWMINNOACTIVE, SW_HIDE}) {
+        ShowWindow(f.hwnd(), state);
+        SendMessageW(f.hwnd(), WM_APP_SHOW, 0, 0);
+        EXPECT_TRUE(IsWindowVisible(f.hwnd()) != FALSE);
+        EXPECT_FALSE(IsIconic(f.hwnd()) != FALSE);
+    }
+    EXPECT_EQ(mutations, 0);
+}
+
+APS_TEST(mainwindow, minimized_connections_refresh_on_the_first_restored_snapshot) {
+    WindowFixture f;
+    HWND connections = findControl(f.hwnd(), 1002);
+    EXPECT_EQ(ListView_GetItemCount(connections), 1);
+    ShowWindow(f.hwnd(), SW_SHOWMINNOACTIVE);
+    const auto changed = manyKernelsSnapshot();
+    f.window->onPipeMessage(changed);
+    EXPECT_EQ(ListView_GetItemCount(connections), 1);
+    SendMessageW(f.hwnd(), WM_APP_SHOW, 0, 0);
+    f.window->onPipeMessage(changed); // identical to the skipped payload
+    EXPECT_EQ(ListView_GetItemCount(connections), 50);
+    EXPECT_EQ(mutations, 0);
+}
 
 APS_TEST(mainwindow, dpi_rebuild_preserves_node_rows_and_selection) {
     WindowFixture f;

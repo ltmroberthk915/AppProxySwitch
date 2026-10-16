@@ -90,7 +90,7 @@ struct RelayParams {
     std::string username;
     std::string password;
     int connectTimeoutMs = 5000;
-    int pumpTimeoutMs = 10000;      // per-send wait inside the pump loop
+    int pumpTimeoutMs = 10000;      // no-progress deadline while bytes are queued
     size_t maxSessions = 1024;
 };
 
@@ -124,8 +124,13 @@ public:
 
 private:
     bool runDnsBridge(RelayFailureKind& failureKind, std::string& err);
+    void replaceProxySocket(SOCKET socket);
+    void closeSockets();
 
     uint64_t id_;
+    // Serialize abort() with publishing/closing handles so shutdown cannot
+    // target a stale handle that Windows has already reused for another flow.
+    std::mutex socketsMu_;
     SOCKET appSock_ = INVALID_SOCKET;
     SOCKET socksSock_ = INVALID_SOCKET;
     net::Endpoint4 appPeer_;
@@ -162,11 +167,12 @@ private:
     void acceptLoop();
     void reapSession(uint64_t id);
 
-    // Session + its thread, kept alive together (self-detaching pattern:
-    // the thread erases its entry and detaches itself as its final act).
+    // sessionsMu_ protects thread publication and ownership. A worker detaches
+    // while still in the map; stop() removes entries before joining them.
+    // These two paths must never operate on the same std::thread concurrently.
     struct RelayEntry {
         std::shared_ptr<RelaySession> session;
-        std::shared_ptr<std::thread> thread;
+        std::thread thread;
     };
 
     RelayParams params_;

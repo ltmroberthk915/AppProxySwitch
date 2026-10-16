@@ -1,7 +1,7 @@
 // Version numbers for the .rc file. Kept in sync with CMake project version.
 #define APS_RC_VER_MAJOR 1
 #define APS_RC_VER_MINOR 3
-#define APS_RC_VER_PATCH 2
+#define APS_RC_VER_PATCH 7
 
 #define APS_RC_FILEVERSION APS_RC_VER_MAJOR,APS_RC_VER_MINOR,APS_RC_VER_PATCH,0
 #define APS_RC_STRINGIFY2(x) #x

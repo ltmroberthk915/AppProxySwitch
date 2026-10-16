@@ -21,13 +21,13 @@ public:
     bool start(const std::wstring& name, MsgHandler onMsg, std::string* err);
     void stop();
 
-    // Send one JSON line to the connected client (no-op when disconnected).
+    // Send one JSON line; a stalled reader times out and resets only IPC.
     bool sendLine(const std::string& line);
     bool hasClient() const { return clientConnected_.load(); }
 
 private:
     void acceptLoop();
-    void readLoop();
+    void readLoop(HANDLE pipe);
 
     std::wstring name_;
     MsgHandler onMsg_;
@@ -49,7 +49,7 @@ public:
 
     void start(const std::wstring& name, MsgHandler onMsg, StateHandler onState);
     void stop();
-    bool sendLine(const std::string& line);   // false when not connected
+    bool sendLine(const std::string& line);   // false on disconnect/write timeout
     bool connected() const { return connected_.load(); }
 
 private:
@@ -59,6 +59,7 @@ private:
     MsgHandler onMsg_;
     StateHandler onState_;
     HANDLE stopEvent_ = nullptr;
+    HANDLE resetEvent_ = nullptr;
     std::thread thread_;
     std::atomic<bool> stopping_{false};
     std::atomic<bool> connected_{false};

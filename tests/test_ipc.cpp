@@ -2,6 +2,7 @@
 #include <winsock2.h>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 
 #include "aps/pipe.hpp"
@@ -130,6 +131,175 @@ APS_TEST(ipc, node_test_request_id_survives_protocol_encoding) {
     EXPECT_TRUE(json::Value::parse(ipc::nodeSwitch("auto-kernel","request-123"),message,nullptr));
     EXPECT_TRUE(message.find("outlet") && message.find("outlet")->asString()=="auto-kernel");
     EXPECT_TRUE(message.find("request_id") && message.find("request_id")->asString()=="request-123");
+}
+
+namespace {
+struct PausedReader {
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE resume = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<bool> paused{false};
+    void onMessage() {
+        if (paused.exchange(true)) return;
+        SetEvent(entered);
+        // Bound the pre-fix regression too: an infinite write must fail the
+        // timing check rather than leave the test process stuck forever.
+        WaitForSingleObject(resume, 2500);
+    }
+    ~PausedReader() { CloseHandle(entered); CloseHandle(resume); }
+};
+
+bool waitConnected(const PipeClient& client) {
+    for (int i=0; i<100 && !client.connected(); ++i) Sleep(20);
+    return client.connected();
+}
+
+std::string largeControlMessage() {
+    return "{\"type\":\"GETSTATUS\",\"padding\":\""+std::string(60000,'x')+"\"}";
+}
+}
+
+APS_TEST(ipc, client_write_times_out_when_engine_stops_reading) {
+    PausedReader peer;
+    std::atomic<bool> recovered{false};
+    std::atomic<int> connections{0};
+    const auto name=L"\\\\.\\pipe\\aps-stalled-client-"+utf8ToWide(newId());
+    PipeServer server;
+    EXPECT_TRUE(server.start(name,[&](const json::Value& message){
+        peer.onMessage();
+        const auto* pid=message.find("pid");
+        if(pid&&pid->isNumber()&&pid->asInt()==77)recovered.store(true);
+    },nullptr));
+    PipeClient client;
+    client.start(name,[](const json::Value&){},[&](bool connected){if(connected)++connections;});
+    EXPECT_TRUE(waitConnected(client));
+    EXPECT_TRUE(client.sendLine(hello(42,"test")));
+    EXPECT_EQ(WaitForSingleObject(peer.entered,2000),WAIT_OBJECT_0);
+    const auto started=std::chrono::steady_clock::now();
+    const auto payload=largeControlMessage();
+    const bool sent=client.sendLine(payload)&&client.sendLine(payload);
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-started).count();
+    SetEvent(peer.resume);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(elapsed<1500);
+    for(int i=0;i<150&&(connections.load()<2||!client.connected());++i)Sleep(20);
+    EXPECT_TRUE(connections.load()>=2);
+    EXPECT_TRUE(client.sendLine(hello(77,"recovered")));
+    for(int i=0;i<100&&!recovered.load();++i)Sleep(20);
+    EXPECT_TRUE(recovered.load());
+    client.stop();server.stop();
+}
+
+APS_TEST(ipc, client_stop_cancels_a_blocked_command_write) {
+    PausedReader peer;
+    const auto name=L"\\\\.\\pipe\\aps-stopped-client-"+utf8ToWide(newId());
+    PipeServer server;
+    EXPECT_TRUE(server.start(name,[&](const json::Value&){peer.onMessage();},nullptr));
+    PipeClient client;
+    client.start(name,[](const json::Value&){},nullptr);
+    EXPECT_TRUE(waitConnected(client));
+    EXPECT_TRUE(client.sendLine(hello(42,"test")));
+    EXPECT_EQ(WaitForSingleObject(peer.entered,2000),WAIT_OBJECT_0);
+    const auto payload=largeControlMessage();
+    EXPECT_TRUE(client.sendLine(payload));
+    std::thread writer([&]{client.sendLine(payload);});
+    Sleep(50);
+    const auto started=std::chrono::steady_clock::now();
+    client.stop();
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-started).count();
+    SetEvent(peer.resume);
+    writer.join();server.stop();
+    EXPECT_TRUE(elapsed<1000);
+}
+
+APS_TEST(ipc, client_can_reconnect_after_write_failure_before_first_read) {
+    PausedReader peer;
+    std::atomic<int> connections{0};
+    std::atomic<bool> failed{false};
+    std::atomic<bool> recovered{false};
+    const auto name=L"\\\\.\\pipe\\aps-early-reset-"+utf8ToWide(newId());
+    PipeServer server;
+    EXPECT_TRUE(server.start(name,[&](const json::Value& message){
+        peer.onMessage();
+        const auto* pid=message.find("pid");
+        if(pid&&pid->isNumber()&&pid->asInt()==77)recovered.store(true);
+    },nullptr));
+    PipeClient client;
+    client.start(name,[](const json::Value&){},[&](bool connected){
+        if(!connected || ++connections!=1)return;
+        // GUI setup sends HELLO in this callback, before the first read exists.
+        if(!client.sendLine(hello(42,"test")))return;
+        if(WaitForSingleObject(peer.entered,2000)!=WAIT_OBJECT_0)return;
+        const auto payload=largeControlMessage();
+        failed.store(!(client.sendLine(payload)&&client.sendLine(payload)));
+    });
+    for(int i=0;i<125&&!failed.load();++i)Sleep(20);
+    SetEvent(peer.resume);
+    EXPECT_TRUE(failed.load());
+    for(int i=0;i<150&&(connections.load()<2||!client.connected());++i)Sleep(20);
+    EXPECT_TRUE(connections.load()>=2);
+    EXPECT_TRUE(client.sendLine(hello(77,"recovered")));
+    for(int i=0;i<100&&!recovered.load();++i)Sleep(20);
+    EXPECT_TRUE(recovered.load());
+    client.stop();server.stop();
+}
+
+APS_TEST(ipc, server_write_times_out_when_gui_stops_reading) {
+    PausedReader peer;
+    std::atomic<bool> recovered{false};
+    std::atomic<int> connections{0};
+    const auto name=L"\\\\.\\pipe\\aps-stalled-server-"+utf8ToWide(newId());
+    PipeServer server;
+    EXPECT_TRUE(server.start(name,[](const json::Value&){},nullptr));
+    PipeClient client;
+    client.start(name,[&](const json::Value& message){
+        peer.onMessage();
+        const auto* state=message.find("state");
+        if(state&&state->isString()&&state->asString()=="RECOVERED")recovered.store(true);
+    },[&](bool connected){if(connected)++connections;});
+    EXPECT_TRUE(waitConnected(client));
+    for(int i=0;i<100&&!server.hasClient();++i)Sleep(20);
+    EXPECT_TRUE(server.sendLine(welcome(true,"test","RUNNING")));
+    EXPECT_EQ(WaitForSingleObject(peer.entered,2000),WAIT_OBJECT_0);
+    const auto started=std::chrono::steady_clock::now();
+    const auto payload=largeControlMessage();
+    const bool sent=server.sendLine(payload)&&server.sendLine(payload);
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-started).count();
+    SetEvent(peer.resume);
+    EXPECT_FALSE(sent);
+    EXPECT_TRUE(elapsed<1500);
+    for(int i=0;i<150&&(connections.load()<2||!server.hasClient());++i)Sleep(20);
+    EXPECT_TRUE(connections.load()>=2);
+    EXPECT_TRUE(server.sendLine(welcome(true,"test","RECOVERED")));
+    for(int i=0;i<100&&!recovered.load();++i)Sleep(20);
+    EXPECT_TRUE(recovered.load());
+    client.stop();server.stop();
+}
+
+APS_TEST(ipc, server_stop_cancels_a_blocked_status_write) {
+    PausedReader peer;
+    const auto name=L"\\\\.\\pipe\\aps-stopped-server-"+utf8ToWide(newId());
+    PipeServer server;
+    EXPECT_TRUE(server.start(name,[](const json::Value&){},nullptr));
+    PipeClient client;
+    client.start(name,[&](const json::Value&){peer.onMessage();},nullptr);
+    EXPECT_TRUE(waitConnected(client));
+    for(int i=0;i<100&&!server.hasClient();++i)Sleep(20);
+    EXPECT_TRUE(server.sendLine(welcome(true,"test","RUNNING")));
+    EXPECT_EQ(WaitForSingleObject(peer.entered,2000),WAIT_OBJECT_0);
+    const auto payload=largeControlMessage();
+    EXPECT_TRUE(server.sendLine(payload));
+    std::thread writer([&]{server.sendLine(payload);});
+    Sleep(50);
+    const auto started=std::chrono::steady_clock::now();
+    server.stop();
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now()-started).count();
+    SetEvent(peer.resume);
+    writer.join();client.stop();
+    EXPECT_TRUE(elapsed<1000);
 }
 
 APS_TEST_MAIN();

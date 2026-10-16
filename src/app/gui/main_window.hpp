@@ -50,6 +50,7 @@ private:
     void stopEngineFromUi(bool confirm);
     void clearLogs();
     void exitApp();
+    void showFromUserRequest(const char* source);
     void exportConfigUi();
     void importConfigUi();
 
@@ -133,7 +134,7 @@ private:
     void refreshNodeStatus(const json::Value& outlets, const json::Value* kernels);
     void ensureRowsFromConfig();          // rows exist as soon as UI opens
     void applyEngineData(const json::Value& engineOutlets);
-    int layoutNodeRows(int w);
+    int layoutNodeRows(int w, bool apply = true);
     void toggleAutoSwitch();
     void onRegionChanged();
     void onClassChanged();

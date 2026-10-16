@@ -304,9 +304,6 @@ private:
     // reports the dead port explicitly).
     uint16_t resolveDefaultSocksPort(const Config& cfg);
     std::string resolveRuleOutlet(const std::string& ruleOutlet) const;
-    net::Endpoint4 outletEndpoint(const std::string& id) const;
-    std::string outletUsername(const std::string& id) const;
-    std::string outletPassword(const std::string& id) const;
     void rebuildHealthMonitors(const Config& cfg);
 
     std::string buildStatusJson() const;

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,84 @@ struct TestSink : IRelaySessionSink {
         down.fetch_add(d);
     }
     void onClosed() override { closed.fetch_add(1); }
+};
+
+// Two independent socket directions, unlike an echo fixture. Deliberately
+// stops reading one direction while exchanging a control word in the other.
+class PressureProxy {
+public:
+    explicit PressureProxy(bool slowDownload) : slowDownload_(slowDownload) {}
+    ~PressureProxy() { stop(); }
+    bool start() {
+        listener_ = net::makeTcpSocket();
+        auto sa = net::toSockaddr({0x7F000001, 0});
+        if (::bind(listener_, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) ||
+            ::listen(listener_, 1)) return false;
+        int len = sizeof(sa);
+        if (getsockname(listener_, reinterpret_cast<sockaddr*>(&sa), &len)) return false;
+        port_ = ntohs(sa.sin_port);
+        worker_ = std::thread([this, listener = listener_] { serve(listener); });
+        return true;
+    }
+    net::Endpoint4 endpoint() const { return {0x7F000001, port_}; }
+    std::atomic<bool> ready{false}, controlReceived{false};
+    void stop() {
+        stopping_.store(true);
+        if (listener_ != INVALID_SOCKET) {
+            shutdown(listener_, SD_BOTH);
+            net::closeSocket(listener_);
+        }
+        const SOCKET peer = peer_.load();
+        if (peer != INVALID_SOCKET) shutdown(peer, SD_BOTH);
+        if (worker_.joinable()) worker_.join();
+    }
+private:
+    void serve(SOCKET listener) {
+        SOCKET c = accept(listener, nullptr, nullptr);
+        if (c == INVALID_SOCKET) return;
+        peer_.store(c);
+        int small = 1024;
+        if (!slowDownload_) setsockopt(c, SOL_SOCKET, SO_RCVBUF,
+                                      reinterpret_cast<const char*>(&small), sizeof(small));
+        char greeting[3]{}, request[10]{};
+        const char method[] = {5, 0};
+        const char accepted[] = {5, 0, 0, 1, 127, 0, 0, 1, 1, static_cast<char>(187)};
+        bool negotiated = net::recvExact(c, greeting, sizeof(greeting), 2000) == 3 &&
+            net::sendAll(c, method, sizeof(method), 2000) == 0 &&
+            net::recvExact(c, request, sizeof(request), 2000) == 10 &&
+            net::sendAll(c, accepted, sizeof(accepted), 2000) == 0;
+        std::thread flood;
+        if (negotiated && !stopping_.load()) {
+            if (slowDownload_) {
+                char init[4]{};
+                if (net::recvExact(c, init, sizeof(init), 2000) == 4) {
+                    flood = std::thread([c] {
+                        std::vector<char> bytes(16 * 1024 * 1024, 'x');
+                        net::sendAll(c, bytes.data(), bytes.size(), 5000);
+                    });
+                    ready.store(true);
+                    char control[4]{};
+                    controlReceived.store(net::recvExact(c, control, sizeof(control), 4000) == 4 &&
+                                          std::memcmp(control, "CTRL", 4) == 0);
+                }
+            } else {
+                ready.store(true);
+                Sleep(700); // allow the upload to fill both socket buffers
+                net::sendAll(c, "CTRL", 4, 2000);
+            }
+            while (!stopping_.load()) Sleep(10);
+        }
+        shutdown(c, SD_BOTH);
+        if (flood.joinable()) flood.join();
+        peer_.store(INVALID_SOCKET);
+        net::closeSocket(c);
+    }
+    bool slowDownload_;
+    SOCKET listener_ = INVALID_SOCKET;
+    std::atomic<SOCKET> peer_{INVALID_SOCKET};
+    uint16_t port_ = 0;
+    std::atomic<bool> stopping_{false};
+    std::thread worker_;
 };
 
 // Bind a client socket to an explicit ephemeral port so the relay's
@@ -364,6 +443,9 @@ APS_TEST(relay, streaming_fin_does_not_claim_http_completion_or_cut_idle_reads) 
             if (ip != cli.local.ip || port != cli.local.port) return std::optional<RelayTarget>();
             RelayTarget target;
             target.origDst = {0x7F000001, upstream.port};
+            target.origSource = cli.local;
+            target.originalPid = 424242;
+            target.outletId = "stream-fixture";
             return std::optional<RelayTarget>(std::move(target));
         }, nullptr));
         const auto address = net::toSockaddr({0x7F000001, relay.listenPort()});
@@ -387,8 +469,124 @@ APS_TEST(relay, streaming_fin_does_not_claim_http_completion_or_cut_idle_reads) 
         EXPECT_TRUE(lines.find("application_completion=unverified") != std::string::npos);
         EXPECT_TRUE(lines.find("first_eof_ms=-1") == std::string::npos);
         EXPECT_TRUE(lines.find("duration_ms=") != std::string::npos);
+        const auto end = lines.find("tcp_completed=true");
+        const auto completion = lines.substr(end, lines.find('\n', end) - end);
+        EXPECT_TRUE(completion.find("engine_pid=" + std::to_string(GetCurrentProcessId())) != std::string::npos);
+        EXPECT_TRUE(completion.find("pid=424242") != std::string::npos);
+        EXPECT_TRUE(completion.find("source=127.0.0.1:" + std::to_string(cli.local.port)) != std::string::npos);
+        EXPECT_TRUE(completion.find("outlet=stream-fixture") != std::string::npos);
+        EXPECT_TRUE(completion.find("proxy_source=127.0.0.1:") != std::string::npos);
+        EXPECT_TRUE(completion.find("address_type=IPv4") != std::string::npos);
         EXPECT_TRUE(lines.find("PAYLOAD_MUST_NOT_APPEAR") == std::string::npos);
     }
+}
+
+APS_TEST(relay, slow_download_reader_does_not_block_upload_control) {
+    for(int round=0;round<3;++round){
+        TempRelayLog diagnostic;
+        EXPECT_TRUE(diagnostic.opened);
+        PressureProxy proxy(true);
+        EXPECT_TRUE(proxy.start());
+        RelayParams params;
+        params.proxy = proxy.endpoint();
+        params.pumpTimeoutMs = 5000;
+        RelayServer relay;
+        EXPECT_TRUE(relay.start(params, 0, [](uint32_t, uint16_t) {
+            RelayTarget t;
+            t.origDst = {0xC0000201, 443};
+            return std::optional<RelayTarget>(t);
+        }, nullptr));
+        PreparedClient cli;
+        EXPECT_TRUE(cli.bind());
+        int small = 1024;
+        setsockopt(cli.s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&small), sizeof(small));
+        EXPECT_EQ(net::connectWithTimeout(cli.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        EXPECT_EQ(net::sendAll(cli.s, "INIT", 4, 2000), 0);
+        EXPECT_TRUE(waitUntil([&] { return proxy.ready.load(); }, 1500));
+        Sleep(500); // do not read the flood; the relay's download send must block
+        EXPECT_EQ(net::sendAll(cli.s, "CTRL", 4, 1000), 0);
+        EXPECT_TRUE(waitUntil([&] { return proxy.controlReceived.load(); }, 1500));
+        const auto stoppingAt = std::chrono::steady_clock::now();
+        relay.stop();
+        const auto stopDuration = std::chrono::steady_clock::now() - stoppingAt;
+        std::printf("    slow-download stop round %d: %lldms\n",round+1,static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(stopDuration).count()));
+        EXPECT_TRUE(stopDuration < std::chrono::seconds(1));
+        const auto stopLog=diagnostic.read();
+        const auto phase=stopLog.find("relay stopped listener_wait_ms=");
+        if(phase!=std::string::npos){
+            std::printf("    %s\n",stopLog.substr(phase,stopLog.find('\n',phase)-phase).c_str());
+        }
+        proxy.stop();
+    }
+}
+
+APS_TEST(relay, stalled_send_has_bounded_deadline_and_correct_failure_side) {
+    for (const bool slowDownload : {true, false}) {
+        PressureProxy proxy(slowDownload);
+        EXPECT_TRUE(proxy.start());
+        RelayParams params;
+        params.proxy = proxy.endpoint();
+        params.pumpTimeoutMs = 150;
+        std::atomic<RelayFailureKind> outcome{RelayFailureKind::None};
+        RelayServer relay;
+        EXPECT_TRUE(relay.start(params, 0, [&](uint32_t, uint16_t) {
+            RelayTarget t;
+            t.origDst = {0xC0000201, 443};
+            t.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
+                             RelayFailureKind kind, const std::string&) { outcome.store(kind); };
+            return std::optional<RelayTarget>(std::move(t));
+        }, nullptr));
+        PreparedClient cli;
+        EXPECT_TRUE(cli.bind());
+        int small = 1024;
+        setsockopt(cli.s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&small), sizeof(small));
+        EXPECT_EQ(net::connectWithTimeout(cli.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        std::thread upload;
+        if (slowDownload) {
+            EXPECT_EQ(net::sendAll(cli.s, "INIT", 4, 1000), 0);
+        } else {
+            upload = std::thread([&] {
+                std::vector<char> bytes(16 * 1024 * 1024, 'y');
+                net::sendAll(cli.s, bytes.data(), bytes.size(), 3000);
+            });
+        }
+        EXPECT_TRUE(waitUntil([&] { return outcome.load() != RelayFailureKind::None; }, 2000));
+        EXPECT_TRUE(outcome.load() == (slowDownload ? RelayFailureKind::Application : RelayFailureKind::Tunnel));
+        shutdown(cli.s, SD_BOTH);
+        if (upload.joinable()) upload.join();
+        relay.stop();
+        proxy.stop();
+    }
+}
+
+APS_TEST(relay, slow_upload_reader_does_not_block_download_control) {
+    PressureProxy proxy(false);
+    EXPECT_TRUE(proxy.start());
+    RelayParams params;
+    params.proxy = proxy.endpoint();
+    params.pumpTimeoutMs = 5000;
+    RelayServer relay;
+    EXPECT_TRUE(relay.start(params, 0, [](uint32_t, uint16_t) {
+        RelayTarget t;
+        t.origDst = {0xC0000201, 443};
+        return std::optional<RelayTarget>(t);
+    }, nullptr));
+    PreparedClient cli;
+    EXPECT_TRUE(cli.bind());
+    EXPECT_EQ(net::connectWithTimeout(cli.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+    std::thread upload([&] {
+        std::vector<char> bytes(16 * 1024 * 1024, 'y');
+        net::sendAll(cli.s, bytes.data(), bytes.size(), 5000);
+    });
+    EXPECT_TRUE(waitUntil([&] { return proxy.ready.load(); }, 1500));
+    char control[4]{};
+    EXPECT_EQ(net::recvExact(cli.s, control, sizeof(control), 2000), 4);
+    EXPECT_TRUE(std::memcmp(control, "CTRL", 4) == 0);
+    shutdown(cli.s, SD_BOTH);
+    upload.join();
+    relay.stop();
+    proxy.stop();
 }
 
 APS_TEST(relay, unknown_peer_is_rejected) {
@@ -761,6 +959,130 @@ APS_TEST(relay, idle_client_can_be_stopped_during_tls_inspection) {
     EXPECT_EQ(relay.counters.aborted.load(), 1u);
     EXPECT_EQ(proxy.requestCount(), 0u);
     proxy.stop();
+}
+
+APS_TEST(relay, parameter_reload_keeps_endpoint_and_credentials_together) {
+    MockSocks5Server first, second;
+    first.setBehavior(aps::test::MockSocksBehavior::EchoConnect);
+    second.setBehavior(aps::test::MockSocksBehavior::EchoConnect);
+    const std::string firstUser = "first-user";
+    const std::string secondUser(120, 'u');
+    const std::string firstPass(72, 'a'), secondPass(144, 'b');
+    first.setRequireAuth(true, firstUser, firstPass);
+    second.setRequireAuth(true, secondUser, secondPass);
+    EXPECT_TRUE(first.start());
+    EXPECT_TRUE(second.start());
+    RelayParams a, b;
+    a.proxy = first.endpoint(); a.username = firstUser; a.password = firstPass;
+    b.proxy = second.endpoint(); b.username = secondUser; b.password = secondPass;
+    auto sink = std::make_shared<TestSink>();
+    RelayServer relay;
+    EXPECT_TRUE(relay.start(a, 0, [&](uint32_t, uint16_t) {
+        RelayTarget target;
+        target.origDst = {0xC0000201, 443};
+        target.sink = sink;
+        return std::optional<RelayTarget>(std::move(target));
+    }, nullptr));
+    std::jthread reloads([&](std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            relay.updateParams(a);
+            relay.updateParams(b);
+            std::this_thread::yield();
+        }
+    });
+    constexpr unsigned count = 64;
+    for (unsigned i = 0; i < count; ++i) {
+        PreparedClient client;
+        EXPECT_TRUE(client.bind());
+        EXPECT_EQ(net::connectWithTimeout(client.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        const char payload[] = "reload-check";
+        EXPECT_EQ(net::sendAll(client.s, payload, sizeof(payload), 2000), 0);
+        shutdown(client.s, SD_SEND);
+        char reply[sizeof(payload)]{};
+        EXPECT_EQ(net::recvExact(client.s, reply, sizeof(reply), 2000), static_cast<int>(sizeof(reply)));
+        EXPECT_TRUE(std::memcmp(payload, reply, sizeof(reply)) == 0);
+        // One application at a time also keeps the auth fixture independent
+        // of its own concurrent-client bookkeeping.
+        EXPECT_TRUE(waitUntil([&] { return sink->closed.load() == i + 1; }, 2000));
+    }
+    reloads.request_stop();
+    reloads.join();
+    relay.stop();
+    EXPECT_EQ(relay.counters.completed.load(), count);
+    EXPECT_EQ(first.requestCount() + second.requestCount(), count);
+    first.stop();
+    second.stop();
+}
+
+APS_TEST(relay, stop_waits_for_all_inflight_completion_callbacks) {
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool release = false;
+    std::atomic<unsigned> entered{0}, returned{0};
+    auto sink = std::make_shared<TestSink>();
+    RelayServer relay;
+    EXPECT_TRUE(relay.start({}, 0, [&](uint32_t, uint16_t) {
+        RelayTarget target;
+        target.sink = sink;
+        target.resolveDns = [](const uint8_t*, size_t, std::vector<uint8_t>&) { return false; };
+        target.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
+                              RelayFailureKind, const std::string&) {
+            entered.fetch_add(1);
+            std::unique_lock<std::mutex> lock(mutex);
+            wake.wait(lock, [&] { return release; });
+            returned.fetch_add(1);
+        };
+        return std::optional<RelayTarget>(std::move(target));
+    }, nullptr));
+    constexpr unsigned count = 12;
+    std::vector<std::unique_ptr<PreparedClient>> clients;
+    for (unsigned i = 0; i < count; ++i) {
+        auto client = std::make_unique<PreparedClient>();
+        EXPECT_TRUE(client->bind());
+        EXPECT_EQ(net::connectWithTimeout(client->s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+        shutdown(client->s, SD_SEND); // no DNS query: immediate orderly EOF
+        clients.push_back(std::move(client));
+    }
+    EXPECT_TRUE(waitUntil([&] { return entered.load() == count; }, 2000));
+    std::atomic<bool> stopped{false};
+    std::thread stopper([&] { relay.stop(); stopped.store(true); });
+    Sleep(50);
+    EXPECT_FALSE(stopped.load());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    wake.notify_all();
+    stopper.join();
+    EXPECT_TRUE(stopped.load());
+    EXPECT_EQ(returned.load(), count);
+    EXPECT_EQ(sink->closed.load(), count);
+    EXPECT_EQ(relay.activeSessions(), 0u);
+    relay.stop(); // repeated stop is harmless
+}
+
+APS_TEST(relay, immediately_closed_connections_are_reaped_before_restart) {
+    RelayServer relay;
+    auto sink = std::make_shared<TestSink>();
+    constexpr unsigned rounds = 4, perRound = 96;
+    for (unsigned round = 0; round < rounds; ++round) {
+        EXPECT_TRUE(relay.start({}, 0, [&](uint32_t, uint16_t) {
+            RelayTarget target;
+            target.sink = sink;
+            target.resolveDns = [](const uint8_t*, size_t, std::vector<uint8_t>&) { return false; };
+            return std::optional<RelayTarget>(std::move(target));
+        }, nullptr));
+        for (unsigned i = 0; i < perRound; ++i) {
+            PreparedClient client;
+            EXPECT_TRUE(client.bind());
+            EXPECT_EQ(net::connectWithTimeout(client.s, {0x7F000001, relay.listenPort()}, 2000, nullptr), 0);
+            shutdown(client.s, SD_SEND);
+        }
+        EXPECT_TRUE(waitUntil([&] { return relay.activeSessions() == 0 &&
+            sink->closed.load() == (round + 1) * perRound; }, 3000));
+        relay.stop();
+    }
+    EXPECT_EQ(sink->closed.load(), rounds * perRound);
 }
 
 APS_TEST_MAIN();

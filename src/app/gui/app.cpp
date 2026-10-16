@@ -94,17 +94,24 @@ int runGui(HINSTANCE hInstance, int nCmdShow) {
     HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\AppProxySwitchGui");
     if (single != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         // Ask the existing instance to surface itself.
-        HANDLE showEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, kShowEventName);
-        if (showEvt) {
-            SetEvent(showEvt);
-            CloseHandle(showEvt);
-        }
         for (int i = 0; i < 20; ++i) {
             HWND existing = FindWindowW(L"ApsMainWindow", nullptr);
             if (existing) {
-                ShowWindow(existing, SW_RESTORE);
-                SetForegroundWindow(existing);
-                return 0;
+                // Use one show path per launch. The event also works with
+                // an older installed GUI that predates WM_APP_SHOW.
+                HANDLE showEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, kShowEventName);
+                if (showEvt) {
+                    const bool signaled = SetEvent(showEvt) != FALSE;
+                    CloseHandle(showEvt);
+                    if (signaled) {
+                        CloseHandle(single);
+                        return 0;
+                    }
+                }
+                if (PostMessageW(existing, WM_APP_SHOW, 1, 0)) {
+                    CloseHandle(single);
+                    return 0;
+                }
             }
             Sleep(50);
         }
@@ -127,15 +134,15 @@ int runGui(HINSTANCE hInstance, int nCmdShow) {
     setMainHwnd(win->hwnd());
     (void)nCmdShow;
 
-    // Let future instances ask us to surface (auto-reset event; a listener
-    // that outlives the window simply fails harmlessly on a stale HWND).
+    // Let future instances ask us to surface. Dispatch on the UI thread so
+    // the listener never changes window state in the middle of a layout.
     HANDLE showEvent = CreateEventW(nullptr, FALSE, FALSE, kShowEventName);
     if (showEvent) {
         std::thread([showEvent, hwnd = win->hwnd()]() {
             while (WaitForSingleObject(showEvent, INFINITE) == WAIT_OBJECT_0) {
-                ShowWindow(hwnd, SW_RESTORE);
-                SetForegroundWindow(hwnd);
+                if (!PostMessageW(hwnd, WM_APP_SHOW, 0, 0)) break;
             }
+            CloseHandle(showEvent);
         }).detach();
     }
 

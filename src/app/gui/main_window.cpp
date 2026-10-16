@@ -52,6 +52,52 @@ constexpr int IDC_BTN_START = 101, IDC_BTN_STOP = 102, IDC_LBL_STATE = 103,
 
 MainWindow* g_main = nullptr;
 
+void setTextIfChanged(HWND window, const wchar_t* text) {
+    if (!window) return;
+    std::wstring current(static_cast<size_t>(GetWindowTextLengthW(window)) + 1, L'\0');
+    const int length = GetWindowTextW(window, current.data(), static_cast<int>(current.size()));
+    current.resize(static_cast<size_t>(length));
+    if (current != text) SetWindowTextW(window, text);
+}
+
+struct Placement { HWND window; RECT rect; };
+
+void applyPlacements(HWND parent, const std::vector<Placement>& placements) {
+    std::vector<Placement> changed;
+    for (const auto& item : placements) {
+        if (!item.window) continue;
+        RECT current{};
+        GetWindowRect(item.window, &current);
+        MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&current), 2);
+        if (!EqualRect(&current, &item.rect)) changed.push_back(item);
+    }
+    if (changed.empty()) return;
+    constexpr UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    HDWP batch = BeginDeferWindowPos(static_cast<int>(changed.size()));
+    for (const auto& item : changed) {
+        if (!batch) break;
+        const auto& r = item.rect;
+        batch = DeferWindowPos(batch, item.window, nullptr, r.left, r.top,
+                               r.right-r.left, r.bottom-r.top, flags);
+    }
+    if (batch && EndDeferWindowPos(batch)) return;
+    // Allocation failure still uses final rectangles, never template positions.
+    for (const auto& item : changed) {
+        const auto& r = item.rect;
+        SetWindowPos(item.window, nullptr, r.left, r.top, r.right-r.left, r.bottom-r.top, flags);
+    }
+}
+
+void updateScrollRange(HWND window, int bar, int maximum, int page, int position) {
+    SCROLLINFO current{sizeof(current), SIF_RANGE | SIF_PAGE | SIF_POS};
+    if (GetScrollInfo(window, bar, &current) && current.nMin == 0 && current.nMax == maximum &&
+        current.nPage == static_cast<UINT>(std::min(page, maximum+1)) && current.nPos == position)
+        return;
+    SCROLLINFO next{sizeof(next), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL};
+    next.nMax = maximum; next.nPage = page; next.nPos = position;
+    SetScrollInfo(window, bar, &next, TRUE);
+}
+
 // Region preference options (code -> display). Codes are validated against
 // the same whitelist in Config::validate.
 struct RegionEntry {
@@ -417,9 +463,9 @@ void MainWindow::buildUi() {
 void MainWindow::layout(int w, int h) {
     if (!rules_.hwnd() || layingOut_ || IsIconic(hwnd_) || w <= 0 || h <= 0) return;
     layingOut_ = true;
-    // DefWindowProc's WM_SETREDRAW removes/re-adds WS_VISIBLE. Doing that to
-    // the top-level taskbar window on every background status push changes
-    // shell-visible state. Child ListViews already batch their own redraws.
+    // Compute final rectangles before moving anything. Resetting controls to
+    // their templates before each layout exposes jumps during live updates.
+    // Do not suppress top-level redraw: that also toggles WS_VISIBLE.
     // The node pane scrolls independently; long results and extra kernels
     // cannot compress either ListView or overlap the notice below it.
     const int viewW = w;
@@ -430,7 +476,7 @@ void MainWindow::layout(int w, int h) {
     const int titleH = Scaled(20);
     const int nodeW = w - 2 * margin;
     const int nodeClientW = nodeW - GetSystemMetricsForDpi(SM_CXVSCROLL, GetDpiForWindow(hwnd_));
-    const int nodeContentH = layoutNodeRows(nodeClientW);
+    const int nodeContentH = layoutNodeRows(nodeClientW, false);
     const int nodeViewH = std::clamp(nodeContentH, Scaled(120), Scaled(260));
     const int minHeight = Scaled(220 + 140 + 32 + 140 + 8 + 34 + 28 + 4 + 8) +
                           nodeViewH + noticeH;
@@ -447,22 +493,23 @@ void MainWindow::layout(int w, int h) {
     const int noticeY = foldY + Scaled(4);
     scrollX_ = std::clamp(scrollX_, 0, w - viewW);
     scrollY_ = std::clamp(scrollY_, 0, contentH - h);
-    SCROLLINFO si{sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL};
-    si.nMax = w - 1; si.nPage = viewW; si.nPos = scrollX_;
-    SetScrollInfo(hwnd_, SB_HORZ, &si, TRUE);
-    si.nMax = contentH - 1; si.nPage = h; si.nPos = scrollY_;
-    SetScrollInfo(hwnd_, SB_VERT, &si, TRUE);
+    updateScrollRange(hwnd_, SB_HORZ, w-1, viewW, scrollX_);
+    updateScrollRange(hwnd_, SB_VERT, contentH-1, h, scrollY_);
+    std::vector<Placement> positions;
     for (const auto& c : fixedControls_) {
-        MoveWindow(c.hwnd, c.rect.left, c.rect.top, c.rect.right - c.rect.left,
-                   c.rect.bottom - c.rect.top, FALSE);
+        positions.push_back({c.hwnd, c.rect});
     }
-    MoveWindow(rules_.hwnd(), margin, Scaled(220), w - 2 * margin, rulesH, TRUE);
-
-    auto move = [](HWND c, int x, int y, int cw, int ch) {
-        if (c) MoveWindow(c, x, y, cw, ch, TRUE);
+    auto move = [&](HWND c, int x, int y, int cw, int ch) {
+        if (!c) return;
+        const RECT final{x, y, x+cw, y+ch};
+        for (auto& item : positions) {
+            if (item.window == c) { item.rect = final; return; }
+        }
+        positions.push_back({c, final});
     };
+    move(rules_.hwnd(), margin, Scaled(220), w - 2 * margin, rulesH);
     move(lblConns_, margin, connTitleY, Scaled(500), titleH);
-    MoveWindow(conns_.hwnd(), margin, connListY, w - 2 * margin, connH, TRUE);
+    move(conns_.hwnd(), margin, connListY, w - 2 * margin, connH);
     move(btnFlush_, margin, btnsY, Scaled(180), btnH);
     move(btnClearLog_, margin + Scaled(188), btnsY, Scaled(100), btnH);
     move(btnAbout_, margin + Scaled(296), btnsY, Scaled(80), btnH);
@@ -484,25 +531,19 @@ void MainWindow::layout(int w, int h) {
          Scaled(24));
     move(nodePane_, margin, firstRowY, nodeW, nodeViewH);
     nodeScrollY_ = std::clamp(nodeScrollY_, 0, std::max(0, nodeContentH - nodeViewH));
-    SCROLLINFO nodeSi{sizeof(nodeSi), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL};
-    nodeSi.nMax = nodeContentH - 1; nodeSi.nPage = nodeViewH; nodeSi.nPos = nodeScrollY_;
-    SetScrollInfo(nodePane_, SB_VERT, &nodeSi, TRUE);
+    updateScrollRange(nodePane_, SB_VERT, nodeContentH-1, nodeViewH, nodeScrollY_);
+    move(btnOffline_, margin + Scaled(636), titleY - Scaled(2), Scaled(300), Scaled(24));
+    move(lblNotice_, margin, noticeY, w - 2 * margin, noticeH);
+    for (auto& item : positions) {
+        OffsetRect(&item.rect, -scrollX_, -scrollY_);
+    }
+    applyPlacements(hwnd_, positions);
+    const bool foldVisible = (GetWindowLongPtrW(btnOffline_, GWL_STYLE) & WS_VISIBLE) != 0;
+    if (foldVisible != (offlineCount_ != 0))
+        ShowWindow(btnOffline_, offlineCount_ ? SW_SHOW : SW_HIDE);
     RECT nodeRc{}; GetClientRect(nodePane_, &nodeRc);
     layoutNodeRows(nodeRc.right);
-    move(btnOffline_, margin + Scaled(636), titleY - Scaled(2), Scaled(300), Scaled(24));
-    ShowWindow(btnOffline_, offlineCount_ ? SW_SHOW : SW_HIDE);
-    move(lblNotice_, margin, noticeY, w - 2 * margin, noticeH);
-    for (HWND child = GetWindow(hwnd_, GW_CHILD); child;
-         child = GetWindow(child, GW_HWNDNEXT)) {
-        RECT rect{};
-        GetWindowRect(child, &rect);
-        MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&rect), 2);
-        SetWindowPos(child, nullptr, rect.left - scrollX_, rect.top - scrollY_,
-                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
     layingOut_ = false;
-    RedrawWindow(hwnd_, nullptr, nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
 void MainWindow::scrollPage(int bar, int code, int position) {
@@ -565,10 +606,7 @@ void MainWindow::scrollNodes(int code, int position) {
     nodeScrollY_ = next;
     SetScrollPos(nodePane_, SB_VERT, next, TRUE);
     RECT rc{}; GetClientRect(nodePane_, &rc);
-    SendMessageW(nodePane_, WM_SETREDRAW, FALSE, 0);
     layoutNodeRows(rc.right);
-    SendMessageW(nodePane_, WM_SETREDRAW, TRUE, 0);
-    RedrawWindow(nodePane_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 void MainWindow::refreshRules() {
@@ -587,7 +625,7 @@ void MainWindow::refreshRules() {
 void MainWindow::refreshStatusText() {
     const wchar_t* s = stateLabel(engineState_);
     std::wstring text = pipeConnected_ ? s : (std::wstring(s) + L"（引擎未连接）");
-    SetWindowTextW(lblState_, text.c_str());
+    setTextIfChanged(lblState_, text.c_str());
     tray_.setTooltip((std::wstring(txt::kAppTitle) + L" - " + s).c_str());
     EnableWindow(btnStop_, pipeConnected_);
     EnableWindow(btnStart_, !pipeConnected_ && !engineLaunching_);
@@ -655,15 +693,15 @@ void MainWindow::refreshEffectiveProxy(const json::Value* proxy) {
         if (const auto* fallback = effectiveProxy_.find("fallback"); fallback && fallback->asBool())
             text += L"（所选出口未就绪，使用默认端口）";
         text += L"；单独绑定出口的规则以活动连接为准";
-        SetWindowTextW(btnTest_, L"检测当前出口");
+        setTextIfChanged(btnTest_, L"检测当前出口");
     } else {
         text = pipeConnected_ ? L"当前出口：等待引擎报告实际地址" :
                                 L"引擎未连接；检测按钮仅检查手动配置端口";
-        SetWindowTextW(btnTest_, pipeConnected_ ? L"等待出口信息" : L"检测手动端口");
+        setTextIfChanged(btnTest_, pipeConnected_ ? L"等待出口信息" : L"检测手动端口");
     }
-    SetWindowTextW(lblEffectiveProxy_, text.c_str());
+    setTextIfChanged(lblEffectiveProxy_, text.c_str());
     if (key != proxyTestKey_) proxyTestDetail_.clear();
-    SetWindowTextW(lblTestResult_, utf8ToWide(proxyTestDetail_).c_str());
+    setTextIfChanged(lblTestResult_, utf8ToWide(proxyTestDetail_).c_str());
     EnableWindow(btnTest_, !key.empty() && !proxyTestThread_.joinable());
 }
 
@@ -1206,7 +1244,6 @@ void MainWindow::ensureRowsFromConfig() {
     for (const auto& o : cfg_.cfg.outlets) {
         want.emplace_back(utf8ToWide(o.id), utf8ToWide(o.name));
     }
-    const size_t previousOfflineCount = offlineCount_;
     offlineCount_ = 0;
     auto required = [this](const KernelRow& k) {
         if (isOutletActive(k.id)) return true;
@@ -1240,7 +1277,7 @@ void MainWindow::ensureRowsFromConfig() {
         for (const auto* k : offlineRows)
             want.emplace_back(k->id, k->name.empty() ? k->id : k->name);
     }
-    SetWindowTextW(btnOffline_, ((showOffline_ ? std::wstring(L"收起未启动内核（")
+    setTextIfChanged(btnOffline_, ((showOffline_ ? std::wstring(L"收起未启动内核（")
                                               : std::wstring(L"展开未启动内核（")) +
                                 std::to_wstring(offlineCount_) + L"）").c_str());
     // Matching outlet IDs alone do not prove the child controls still exist
@@ -1261,13 +1298,6 @@ void MainWindow::ensureRowsFromConfig() {
         }
     }
     if (!changed) {
-        for (size_t i = 0; i < want.size(); ++i) {
-            if (want[i].first.starts_with(L"auto-"))
-                SetWindowTextW(nodeRows_[i].lblName, want[i].second.c_str());
-        }
-        if (previousOfflineCount != offlineCount_) {
-            RECT rc{}; GetClientRect(hwnd_, &rc); layout(rc.right, rc.bottom);
-        }
         return;
     }
     for (auto& r : nodeRows_) {
@@ -1314,12 +1344,21 @@ void MainWindow::ensureRowsFromConfig() {
                      TRUE);
         nodeRows_.push_back(std::move(row));
     }
-    RECT rcAll{};
-    GetClientRect(hwnd_, &rcAll);
-    layout(rcAll.right, rcAll.bottom);
 }
 
 void MainWindow::applyEngineData(const json::Value& engineOutlets) {
+    // Resolve placeholders and liveness overrides before publishing text;
+    // otherwise an absent API row flashes a placeholder on every STATS tick.
+    std::map<HWND, std::wstring> pendingText;
+    auto queueText = [&](HWND control, const wchar_t* text) { pendingText[control] = text; };
+
+    for (const auto& kernel : kernels_) {
+        for (const auto& row : nodeRows_) {
+            if (row.outletId == kernel.id)
+                pendingText[row.lblName] = kernel.name.empty() ? kernel.id : kernel.name;
+        }
+    }
+
     // Clear placeholders that belong to a previous connection state. Some
     // outlets (e.g. disabled manual entries) legitimately have no API row.
     for (const auto& row : nodeRows_) {
@@ -1335,9 +1374,9 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
             if (!outlet.enabled) label = L"手动出口未启用";
             else if (!outlet.hasClashApi()) label = L"手动出口未配置节点控制器";
         }
-        SetWindowTextW(row.lblStatus, label);
-        SetWindowTextW(row.lblSwitch, L"");
-        SetWindowTextW(row.lblMetadata, L"");
+        queueText(row.lblStatus, label);
+        queueText(row.lblSwitch, L"");
+        queueText(row.lblMetadata, L"");
     }
     // Collect the provider's group names (for the class popup's 分组 entries).
     std::vector<std::wstring> groups;
@@ -1374,7 +1413,7 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
             // port died (the local-config name would keep showing the stale
             // number).
             if (!name.empty() && !id.starts_with(L"auto-"))
-                SetWindowTextW(row.lblName, name.c_str());
+                queueText(row.lblName, name.c_str());
             bool api = o.find("api") && o.find("api")->asBool();
             bool alive = o.find("alive") && o.find("alive")->asBool();
             bool switching = o.find("switching") && o.find("switching")->asBool();
@@ -1400,7 +1439,7 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
             } else {
                 text = utf8ToWide(node) + L" 不可达";
             }
-            SetWindowTextW(row.lblStatus, text.c_str());
+            queueText(row.lblStatus, text.c_str());
             std::wstring metadata;
             const auto* mode = o.find("runtime_mode");
             const std::string runtimeMode = mode ? mode->asString() : std::string();
@@ -1428,7 +1467,7 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
                 if (!metadata.empty()) metadata += L" · ";
                 metadata += L"模式: " + utf8ToWide(runtimeMode);
             }
-            SetWindowTextW(row.lblMetadata, metadata.c_str());
+            queueText(row.lblMetadata, metadata.c_str());
             // "上次切换" on its OWN line: the first line stays short and
             // never clips against the button at narrow widths.
             const auto* warning = o.find("routing_warning");
@@ -1436,7 +1475,7 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
                 if (!detail.empty()) detail += "；";
                 detail += warning->asString();
             }
-            SetWindowTextW(row.lblSwitch, switching ? L"" : utf8ToWide(detail).c_str());
+            queueText(row.lblSwitch, switching ? L"" : utf8ToWide(detail).c_str());
 
             // "测试并连接" completion: when the probed outlet reports ALIVE,
             // flip the config so it becomes the active outlet. Cleared on
@@ -1458,7 +1497,7 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
                     updateRadioChecks();
                 } else {
                     // A stale result predating this request is not its outcome.
-                    SetWindowTextW(row.lblStatus, L"测量中…");
+                    queueText(row.lblStatus, L"测量中…");
                 }
             }
             break;
@@ -1470,22 +1509,23 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
         for (const auto& row : nodeRows_) {
             if (row.outletId != k.id) continue;
             if (!k.alive && k.seen) {
-                SetWindowTextW(row.lblStatus, L"内核未启动");
-                SetWindowTextW(row.lblSwitch, L"");
-                SetWindowTextW(row.lblMetadata, L"");
+                queueText(row.lblStatus, L"内核未启动");
+                queueText(row.lblSwitch, L"");
+                queueText(row.lblMetadata, L"");
             } else if (k.alive && !k.hasApi) {
-                SetWindowTextW(row.lblStatus, L"内核运行中；节点控制器未识别");
-                SetWindowTextW(row.lblSwitch, k.discoveryError.empty()
+                queueText(row.lblStatus, L"内核运行中；节点控制器未识别");
+                queueText(row.lblSwitch, k.discoveryError.empty()
                     ? L"可检测当前出口的 SOCKS5 端口；节点状态暂不可查询"
                     : k.discoveryError.c_str());
-                SetWindowTextW(row.lblMetadata, L"");
+                queueText(row.lblMetadata, L"");
             }
         }
     }
+    for (const auto& entry : pendingText) setTextIfChanged(entry.first, entry.second.c_str());
 }
 
 
-int MainWindow::layoutNodeRows(int w) {
+int MainWindow::layoutNodeRows(int w, bool apply) {
     if (!nodePane_) return Scaled(120);
     const int right = w - Scaled(4);
     const int btnW = Scaled(170);   // must fit "测试并连接" + radio dot @225% DPI
@@ -1503,22 +1543,27 @@ int MainWindow::layoutNodeRows(int w) {
         return std::max<int>(minimum, rect.bottom + Scaled(2));
     };
     int y = Scaled(4);
+    std::vector<Placement> positions;
+    auto place = [&](HWND control, int x, int rowY, int width, int height) {
+        positions.push_back({control, {x, rowY, x+width, rowY+height}});
+    };
     for (auto& row : nodeRows_) {
         const int firstH = std::max({textHeight(row.lblName, nameW, Scaled(20)),
                                     textHeight(row.lblStatus, statusW, Scaled(20)), Scaled(23)});
         const int metadataH = textHeight(row.lblMetadata, statusW);
         const int detailH = textHeight(row.lblSwitch, statusW);
         const int screenY = y - nodeScrollY_;
-        MoveWindow(row.lblName, Scaled(4), screenY, nameW, firstH, FALSE);
-        MoveWindow(row.lblStatus, statusX, screenY, statusW, firstH, FALSE);
-        MoveWindow(row.btnSpeed, right - btnW, screenY, btnW, Scaled(23), FALSE);
-        MoveWindow(row.lblMetadata, statusX, screenY + firstH + Scaled(2), statusW, metadataH, FALSE);
+        place(row.lblName, Scaled(4), screenY, nameW, firstH);
+        place(row.lblStatus, statusX, screenY, statusW, firstH);
+        place(row.btnSpeed, right - btnW, screenY, btnW, Scaled(23));
+        place(row.lblMetadata, statusX, screenY + firstH + Scaled(2), statusW, metadataH);
         const int detailY = firstH + (metadataH ? metadataH + Scaled(2) : 0) + Scaled(2);
-        MoveWindow(row.lblSwitch, statusX, screenY + detailY, statusW, detailH, FALSE);
+        place(row.lblSwitch, statusX, screenY + detailY, statusW, detailH);
         y += detailY + detailH + Scaled(10);
     }
     SelectObject(dc, oldFont);
     ReleaseDC(nodePane_, dc);
+    if (apply) applyPlacements(nodePane_, positions);
     return y;
 }
 
@@ -1532,7 +1577,9 @@ void MainWindow::updateRadioChecks() {
         bool active = autoId.empty()
                           ? (row.outletId == L"__default__")
                           : (wideToUtf8(row.outletId) == autoId);
-        SendMessageW(row.btnSpeed, BM_SETCHECK, active ? BST_CHECKED : BST_UNCHECKED, 0);
+        const WPARAM state = active ? BST_CHECKED : BST_UNCHECKED;
+        if (SendMessageW(row.btnSpeed, BM_GETCHECK, 0, 0) != static_cast<LRESULT>(state))
+            SendMessageW(row.btnSpeed, BM_SETCHECK, state, 0);
     }
 }
 

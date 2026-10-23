@@ -171,7 +171,8 @@ void RelayServer::acceptLoop() {
                     const RelayTarget& t = done.target();
                     if (t.onResult) {
                         t.onResult(t.outletId, t.origDst.ip, t.origDst.port,
-                                   done.ok(), done.failureKind(), done.error());
+                                   done.ok(), done.failureKind(), done.error(),
+                                   done.effectiveDomain());
                     }
                 });
                 reapSession(s.id());

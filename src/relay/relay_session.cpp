@@ -268,9 +268,17 @@ void RelaySession::run(std::function<void(RelaySession&)> onDone) {
         // abort() shuts both sockets down from another thread. That wake-up
         // can surface as app/socks recv error before the loop checks its flag;
         // the explicit engine teardown remains authoritative over that race.
-        if (!ok && abortFlag_.load()) {
+        if (abortFlag_.load()) {
+            ok = false;
             failureKind = RelayFailureKind::Aborted;
+        } else if (ok && !tlsDomain.empty() &&
+                   std::string_view(firstEof) == "proxy" &&
+                   bytesUp_.load() > 0 && bytesDown_.load() == 0) {
+            ok = false;
+            failureKind = RelayFailureKind::TlsNoResponse;
+            error_ = "proxy closed before any TLS response";
         }
+        effectiveDomain_ = tlsDomain;
         ok_.store(ok);
         failureKind_.store(failureKind);
         if (failureKind == RelayFailureKind::Aborted) {

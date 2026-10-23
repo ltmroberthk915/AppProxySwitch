@@ -29,6 +29,7 @@ enum class RelayFailureKind {
     Configuration,  // credentials/protocol configuration is unusable
     Internal,
     Aborted,        // engine-initiated teardown
+    TlsNoResponse,  // authorized ClientHello sent; proxy EOF without any reply
 };
 
 inline const char* relayFailureKindName(RelayFailureKind kind) {
@@ -40,6 +41,7 @@ inline const char* relayFailureKindName(RelayFailureKind kind) {
         case RelayFailureKind::Configuration: return "configuration";
         case RelayFailureKind::Internal: return "internal";
         case RelayFailureKind::Aborted: return "aborted";
+        case RelayFailureKind::TlsNoResponse: return "tls-no-response";
     }
     return "unknown";
 }
@@ -81,7 +83,7 @@ struct RelayTarget {
     // Called on the session thread right before the session is reaped.
     std::function<void(const std::string& outletId, uint32_t dstIp,
                        uint16_t dstPort, bool ok, RelayFailureKind failureKind,
-                       const std::string& err)>
+                       const std::string& err, const std::string& domain)>
         onResult;
 };
 
@@ -121,6 +123,7 @@ public:
     const std::string& error() const { return error_; }
     const net::Endpoint4& appPeer() const { return appPeer_; }
     const RelayTarget& target() const { return target_; }
+    const std::string& effectiveDomain() const { return effectiveDomain_; }
 
 private:
     bool runDnsBridge(RelayFailureKind& failureKind, std::string& err);
@@ -140,6 +143,7 @@ private:
     std::atomic<bool> ok_{false};
     std::atomic<RelayFailureKind> failureKind_{RelayFailureKind::None};
     std::string error_;
+    std::string effectiveDomain_;
     std::atomic<uint64_t> bytesUp_{0};
     std::atomic<uint64_t> bytesDown_{0};
 };

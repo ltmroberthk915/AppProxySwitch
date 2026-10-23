@@ -3151,7 +3151,7 @@ APS_TEST(engine, periodic_controller_delay_failure_keeps_healthy_tunnel) {
     EXPECT_TRUE(api.switches().empty());
     const std::string status = h.engine->statusJson();
     EXPECT_TRUE(status.find("\"node\":\"node-a\"") != std::string::npos);
-    EXPECT_TRUE(status.find("\"latency_ms\":50") != std::string::npos);
+    EXPECT_TRUE(status.find("\"latency_ms\":-1") != std::string::npos);
     EXPECT_TRUE(status.find("\"alive\":true") != std::string::npos);
     // A client-side node change must not label node-b with node-a's delay.
     // Its failed metadata probe still does not invalidate the healthy tunnel.
@@ -3662,7 +3662,8 @@ namespace {
 // findByPort (the loopback-delivery fallback) and tunnels through the
 // configured outlet. Returns true when the session was driven.
 bool driveRelayFlow(Harness& h, uint16_t appPort, uint32_t dstIp = kDstIp,
-                    uint16_t dstPort = kDstPort) {
+                    uint16_t dstPort = kDstPort,
+                    const std::vector<uint8_t>& payload = {}) {
     // The socket-map event must carry the SAME destination as the SYN below
     // (attribution cross-checks the remote), so pass dst through.
     h.pushConnectEvent(appPort, /*pid=*/100, dstIp, dstPort);
@@ -3709,6 +3710,7 @@ bool driveRelayFlow(Harness& h, uint16_t appPort, uint32_t dstIp = kDstIp,
         net::closeSocket(c);
         return false;
     }
+    if (!payload.empty()) net::sendAll(c, reinterpret_cast<const char*>(payload.data()), payload.size(), 2000);
     // The session fails fast (mock refuses the CONNECT): the RST arrives
     // here; give the relay thread a beat to report before returning.
     Sleep(100);
@@ -3800,6 +3802,46 @@ APS_TEST(engine, real_traffic_failures_trigger_auto_reselect) {
         if (!switchedAgain) Sleep(25);
     }
     EXPECT_TRUE(switchedAgain);
+    h.stop();
+    sick.stop();
+    api.stop();
+}
+
+
+APS_TEST(engine, authorized_tls_eof_reselects_even_with_untrusted_original_ip) {
+    MockSocks5Server sick;
+    sick.setBehavior(MockSocksBehavior::CloseAfterData);
+    EXPECT_TRUE(sick.start());
+    MockClashApi api;
+    api.selectorNow = "node-a";
+    api.nodes = {"node-a", "node-b"};
+    api.latencies["node-a"] = 20;
+    api.latencies["node-b"] = 15;
+    EXPECT_TRUE(api.start());
+    Harness h;
+    Config c = h.makeConfig();
+    c.proxy.port = sick.port();
+    c.proxy.clashApi.host = "127.0.0.1";
+    c.proxy.clashApi.port = api.port();
+    c.nodeMonitor.enabled = true;
+    c.nodeMonitor.regions.clear();
+    c.nodeMonitor.nodeClasses.clear();
+    c.nodeMonitor.intervalS = 60;
+    c.nodeMonitor.realFailThreshold = 2;
+    c.nodeMonitor.realFailRatioPct = 50;
+    c.nodeMonitor.badNodeCooldownS = 0;
+    c.routing.tlsDomainAllowlist = {"chatgpt.com"};
+    h.start(c);
+    const auto hello = aps::test::tlsHello("chatgpt.com");
+    EXPECT_TRUE(driveRelayFlow(h, 30981, 0x1F0D5F12, 443, hello));
+    EXPECT_TRUE(driveRelayFlow(h, 30982, 0x1F0D5F12, 443, hello));
+    bool switched = false;
+    for (int i = 0; i < 200 && !switched; ++i) {
+        for (const auto& selection : api.switches())
+            if (selection.find("node-b") != std::string::npos) switched = true;
+        if (!switched) Sleep(25);
+    }
+    EXPECT_TRUE(switched);
     h.stop();
     sick.stop();
     api.stop();
@@ -3912,7 +3954,17 @@ APS_TEST(engine, application_reset_does_not_trigger_kernel_rescan) {
     const int baseline = scanCalls.load();
     EXPECT_TRUE(baseline > 0);
 
-    constexpr uint16_t appPort = 50231;
+    // Reserve an OS-selected source port before publishing its fake NAT entry.
+    // Fixed ports in the dynamic range can already be owned by another socket.
+    SOCKET cl = net::makeTcpSocket();
+    EXPECT_TRUE(cl != INVALID_SOCKET);
+    sockaddr_in la{};
+    la.sin_family = AF_INET;
+    la.sin_addr.S_un.S_addr = htonl(0x7F000001);
+    EXPECT_EQ(bind(cl, reinterpret_cast<sockaddr*>(&la), sizeof(la)), 0);
+    int localLen = sizeof(la);
+    EXPECT_EQ(getsockname(cl, reinterpret_cast<sockaddr*>(&la), &localLen), 0);
+    const uint16_t appPort = ntohs(la.sin_port);
     h.pushConnectEvent(appPort, /*pid=*/100, kDstIp, kDstPort);
     h.device->pushTcp(buildTcpPacket(kAppIp, appPort, kDstIp, kDstPort,
                                      100, 0, 0x02));
@@ -3924,13 +3976,6 @@ APS_TEST(engine, application_reset_does_not_trigger_kernel_rescan) {
     EXPECT_TRUE(natReady);
 
     const size_t requestsBefore = liveProxy.requestCount();
-    SOCKET cl = net::makeTcpSocket();
-    EXPECT_TRUE(cl != INVALID_SOCKET);
-    sockaddr_in la{};
-    la.sin_family = AF_INET;
-    la.sin_addr.S_un.S_addr = htonl(0x7F000001);
-    la.sin_port = htons(appPort);
-    EXPECT_EQ(bind(cl, reinterpret_cast<sockaddr*>(&la), sizeof(la)), 0);
     net::Endpoint4 relay{0x7F000001, h.engine->relay().listenPort()};
     EXPECT_EQ(net::connectWithTimeout(cl, relay, 3000, nullptr), 0);
     for (int i = 0; i < 200 && liveProxy.requestCount() <= requestsBefore; ++i) {

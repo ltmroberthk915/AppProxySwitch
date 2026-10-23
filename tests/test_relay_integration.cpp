@@ -534,7 +534,7 @@ APS_TEST(relay, stalled_send_has_bounded_deadline_and_correct_failure_side) {
             RelayTarget t;
             t.origDst = {0xC0000201, 443};
             t.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
-                             RelayFailureKind kind, const std::string&) { outcome.store(kind); };
+                             RelayFailureKind kind, const std::string&, const std::string&) { outcome.store(kind); };
             return std::optional<RelayTarget>(std::move(t));
         }, nullptr));
         PreparedClient cli;
@@ -589,6 +589,47 @@ APS_TEST(relay, slow_upload_reader_does_not_block_download_control) {
     proxy.stop();
 }
 
+
+APS_TEST(relay, authorized_tls_zero_response_is_failure_but_client_fin_is_not) {
+    for (const bool clientFirst : {false, true}) {
+        MockSocks5Server proxy;
+        proxy.setBehavior(aps::test::MockSocksBehavior::CloseAfterData);
+        EXPECT_TRUE(proxy.start());
+        PreparedClient cli;
+        EXPECT_TRUE(cli.bind());
+        RelayParams params;
+        params.proxy = proxy.endpoint();
+        RelayServer relay;
+        std::atomic<int> outcome{-1};
+        std::string domain;
+        EXPECT_TRUE(relay.start(params, 0, [&](uint32_t, uint16_t) {
+            RelayTarget t;
+            t.origDst = {0x1F0D5F12, 443}; // cached unrelated address
+            t.tlsDomainAllowlist = {"chatgpt.com"};
+            t.onResult = [&](const std::string&, uint32_t, uint16_t, bool ok,
+                             RelayFailureKind kind, const std::string&,
+                             const std::string& effective) {
+                domain = effective;
+                outcome.store(ok ? 0 : static_cast<int>(kind));
+            };
+            return std::optional<RelayTarget>(std::move(t));
+        }, nullptr));
+        auto ra = net::toSockaddr({0x7F000001, relay.listenPort()});
+        EXPECT_EQ(::connect(cli.s, reinterpret_cast<sockaddr*>(&ra), sizeof(ra)), 0);
+        auto hello = aps::test::tlsHello("chatgpt.com");
+        EXPECT_EQ(net::sendAll(cli.s, reinterpret_cast<const char*>(hello.data()), hello.size(), 2000), 0);
+        if (clientFirst) shutdown(cli.s, SD_SEND);
+        char byte;
+        EXPECT_TRUE(net::recvSome(cli.s, &byte, 1, 3000) <= 0);
+        if (!clientFirst) shutdown(cli.s, SD_SEND);
+        EXPECT_TRUE(waitUntil([&] { return outcome.load() >= 0; }, 2000));
+        EXPECT_EQ(outcome.load(), clientFirst ? 0 : static_cast<int>(RelayFailureKind::TlsNoResponse));
+        EXPECT_STREQ(domain, "chatgpt.com");
+        relay.stop();
+        proxy.stop();
+    }
+}
+
 APS_TEST(relay, unknown_peer_is_rejected) {
     MockSocks5Server socks;
     EXPECT_TRUE(socks.start());
@@ -627,7 +668,7 @@ APS_TEST(relay, dead_proxy_fails_fast_with_rst) {
             RelayTarget t;
             t.origDst = net::Endpoint4{0x7F000001, 80};
             t.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
-                             RelayFailureKind kind, const std::string&) {
+                             RelayFailureKind kind, const std::string&, const std::string&) {
                 failureKind.store(static_cast<int>(kind));
             };
             return std::optional<RelayTarget>(std::move(t));
@@ -665,7 +706,7 @@ APS_TEST(relay, refused_connect_reports_tunnel_not_endpoint) {
             RelayTarget t;
             t.origDst = net::Endpoint4{0x08080808, 443};
             t.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
-                             RelayFailureKind kind, const std::string&) {
+                             RelayFailureKind kind, const std::string&, const std::string&) {
                 failureKind.store(static_cast<int>(kind));
             };
             return std::optional<RelayTarget>(std::move(t));
@@ -1026,7 +1067,7 @@ APS_TEST(relay, stop_waits_for_all_inflight_completion_callbacks) {
         target.sink = sink;
         target.resolveDns = [](const uint8_t*, size_t, std::vector<uint8_t>&) { return false; };
         target.onResult = [&](const std::string&, uint32_t, uint16_t, bool,
-                              RelayFailureKind, const std::string&) {
+                              RelayFailureKind, const std::string&, const std::string&) {
             entered.fetch_add(1);
             std::unique_lock<std::mutex> lock(mutex);
             wake.wait(lock, [&] { return release; });

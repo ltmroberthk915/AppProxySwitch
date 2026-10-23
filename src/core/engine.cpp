@@ -372,9 +372,10 @@ bool Engine::start(const Config& cfg, std::string* err) {
                                                     uint32_t dip,
                                                     uint16_t dport, bool ok,
                                                     RelayFailureKind failureKind,
-                                                    const std::string& err) {
+                                                    const std::string& err,
+                                                    const std::string& domain) {
                                     onRelayResult(oid, dip, dport, ok,
-                                                  failureKind, err);
+                                                  failureKind, err, domain);
                                 };
                             }
                             return t;
@@ -1763,7 +1764,7 @@ json::Value Engine::kernelsJson() const {
 void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
                            uint16_t dstPort, bool ok,
                            RelayFailureKind failureKind,
-                           const std::string& err) {
+                           const std::string& err, const std::string& domain) {
     // Engine-initiated aborts are not a verdict on the egress.
     if (!ok && failureKind == RelayFailureKind::Aborted) return;
     if (!ok) {
@@ -1781,7 +1782,8 @@ void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
         // Application resets and internal/configuration failures say nothing
         // about either the local listener or the selected node. Tunnel
         // failures alone may feed the trusted real-traffic signal below.
-        if (failureKind != RelayFailureKind::Tunnel) return;
+        if (failureKind != RelayFailureKind::Tunnel &&
+            failureKind != RelayFailureKind::TlsNoResponse) return;
     }
     auto rt = runtime();
     if (!rt) return;
@@ -1805,12 +1807,14 @@ void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
         } else {
             // Trust snapshot at failure time (the switch's cache flush
             // hasn't happened yet): only destinations WE resolved count.
-            const bool trusted = dnsCacheContainsIp(dstIp);
+            const bool trusted = dnsCacheContainsIp(dstIp) ||
+                (failureKind == RelayFailureKind::TlsNoResponse && !domain.empty());
             if (trusted) {
                 countedFailure = true;
                 s.fails++;
                 s.lastFailIp = dstIp;
                 s.lastFailPort = dstPort;
+                s.lastFailDomain = domain;
                 s.lastFailMs = now;
                 s.lastFailTrusted = true;
             }
@@ -1886,6 +1890,7 @@ void Engine::clearFlowSignal(const std::string& outletId) {
     it->second.fails = 0;
     it->second.lastFailIp = 0;
     it->second.lastFailPort = 0;
+    it->second.lastFailDomain.clear();
     it->second.lastFailMs = 0;
     it->second.lastFailTrusted = false;
     // windowStartMs / lastAutoRoundMs stay: they gate repeats, not verdicts.
@@ -1906,6 +1911,7 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
     uint32_t ip = 0;
     uint16_t port = 0;
     bool trusted = false;
+    std::string domain;
     {
         std::lock_guard<std::mutex> lk(flowSignalMu_);
         auto it = flowSignals_.find(outletId);
@@ -1917,6 +1923,7 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
         }
         ip = s.lastFailIp;
         port = s.lastFailPort;
+        domain = s.lastFailDomain;
         trusted = s.lastFailTrusted;
     }
     if (!trusted) {
@@ -1928,6 +1935,14 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
         log::wf("node monitor [{}]: verification target {}:{} was not "
                 "resolved by us (stale/poisoned app-side answer); skipping "
                 "the verdict", outletId, formatIpv4(ip), port);
+        return VerifyOutcome::NoVerdict;
+    }
+    if (!domain.empty()) {
+        // Mihomo acknowledges CONNECT before dialing. Neither that ACK nor
+        // the app's original (possibly polluted) IP can confirm TLS recovery.
+        // Keep the signal; subsequent real traffic supplies the verdict.
+        log::ifmt("node monitor [{}]: awaiting real TLS traffic for {}; "
+                  "SOCKS acceptance cannot confirm recovery", outletId, domain);
         return VerifyOutcome::NoVerdict;
     }
     const auto outlet = outletParams(outletId);
@@ -2233,7 +2248,6 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     st.apiError.clear();
     st.selectionSatisfied = true;
     const bool sameGroup = st.group == group->name;
-    const bool sameNode = sameGroup && st.node == group->now;
     if (!sameGroup) {
         log::ifmt("node monitor [{}]: scope changed from '{}' to '{}' (mode={})",
                   outletId, st.group, group->name, st.runtimeMode);
@@ -2256,7 +2270,6 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
             st.group + "」；其他业务出口及 HTTP/WSS 流完整性未验证";
     }
     st.region = regionOfNode(st.node);
-    const int previousLatencyMs = st.latencyMs;
     const int controllerLatencyMs =
         client.nodeDelay(group->now, nm.delayUrl, nm.delayTimeoutMs,
                          nm.delayTimeoutMs + 3000);
@@ -2264,11 +2277,6 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     const bool tunnelHealthy = outletHealthy(outletId);
     if (controllerProbeAlive) {
         st.latencyMs = controllerLatencyMs;
-    } else if (tunnelHealthy && sameNode) {
-        // Preserve the last useful figure for this same node. Publishing -1 on one failed
-        // controller request made a genuinely healthy tunnel look dead in
-        // the UI and helped prompt unnecessary manual switching.
-        st.latencyMs = previousLatencyMs;
     } else {
         st.latencyMs = -1;
     }
@@ -2279,8 +2287,10 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     // failure, and a failed real tunnel is authoritative in either mode.
     st.alive = tunnelHealthy && (controllerProbeAlive || !manualRound);
     if (!controllerProbeAlive && tunnelHealthy && !manualRound) {
-        log::df("node monitor [{}]: controller delay failed for {}, but the "
-                "real tunnel is healthy; keeping the node",
+        st.selectionSatisfied = false;
+        st.routingWarning += "；当前测速失败，业务可达性待确认";
+        log::df("node monitor [{}]: controller delay failed for {}; "
+                "local SOCKS accepts requests, TLS reachability unverified",
                 outletId, group->now);
     } else if (controllerProbeAlive && !tunnelHealthy) {
         log::wf("node monitor [{}]: {} passes controller delay ({}ms), but "

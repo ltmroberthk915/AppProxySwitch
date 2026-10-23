@@ -1,7 +1,7 @@
 ﻿; AppProxySwitch installer (Inno Setup 6).
 ; UTF-8 with BOM: Chinese strings are kept as-is.
 #define MyAppName "AppProxySwitch"
-#define MyAppVersion "1.3.7"
+#define MyAppVersion "1.3.8"
 #define MyAppExeName "AppProxySwitch.exe"
 
 [Setup]

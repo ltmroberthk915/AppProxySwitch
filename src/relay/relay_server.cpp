@@ -1,5 +1,7 @@
 #include "aps/relay_server.hpp"
 
+#include <chrono>
+
 #include "aps/log.hpp"
 #include "aps/path_util.hpp"
 
@@ -44,34 +46,31 @@ bool RelayServer::start(const RelayParams& params, uint16_t listenPort, Resolver
 
 void RelayServer::stop() {
     if (listener_ == INVALID_SOCKET) return;
+    const auto stopStarted = std::chrono::steady_clock::now();
     stopping_.store(true);
     shutdown(listener_, SD_BOTH);
     closesocket(listener_);
-    listener_ = INVALID_SOCKET;
     if (acceptThread_.joinable()) acceptThread_.join();
+    const auto listenerStopped = std::chrono::steady_clock::now();
+    listener_ = INVALID_SOCKET; // acceptLoop no longer reads this member
+    listenPort_.store(0);
 
-    // Abort and join every live session. Sessions that finish on their own
-    // detach themselves; joining a detached thread throws, hence the guard.
-    for (int round = 0; round < 60; ++round) {
-        std::vector<std::shared_ptr<RelayEntry>> toAbort;
-        {
-            std::lock_guard<std::mutex> lk(sessionsMu_);
-            for (auto& kv : sessions_) toAbort.push_back(kv.second);
-            if (toAbort.empty()) return;
-        }
-        for (auto& e : toAbort) {
-            e->session->abort();
-            if (e->thread && e->thread->joinable()) {
-                try {
-                    e->thread->join();
-                } catch (const std::system_error&) {
-                    // Already detached itself.
-                }
-            }
-            std::lock_guard<std::mutex> lk(sessionsMu_);
-            sessions_.erase(e->session->id());
-        }
+    // Claim all remaining thread objects under the same lock used by the
+    // self-reaper. Removed workers can no longer detach themselves. Wake all
+    // sessions before joining so one slow close does not postpone the others.
+    std::map<uint64_t, std::shared_ptr<RelayEntry>> toAbort;
+    {
+        std::lock_guard<std::mutex> lk(sessionsMu_);
+        toAbort.swap(sessions_);
     }
+    for (auto& [id, entry] : toAbort) entry->session->abort();
+    for (auto& [id, entry] : toAbort) {
+        if (entry->thread.joinable()) entry->thread.join();
+    }
+    log::ifmt("relay stopped listener_wait_ms={} session_wait_ms={} sessions={}",
+        std::chrono::duration_cast<std::chrono::milliseconds>(listenerStopped-stopStarted).count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-listenerStopped).count(),
+        toAbort.size());
 }
 
 size_t RelayServer::activeSessions() const {
@@ -99,19 +98,13 @@ void RelayServer::updateParams(const RelayParams& params) {
 }
 
 void RelayServer::reapSession(uint64_t id) {
-    std::shared_ptr<RelayEntry> entry;
-    {
-        std::lock_guard<std::mutex> lk(sessionsMu_);
-        auto it = sessions_.find(id);
-        if (it != sessions_.end()) {
-            entry = it->second;
-            sessions_.erase(it);
-        }
-    }
-    // Self-detach: called by the session's own thread as its final act. The
-    // entry (and with it the joinable thread) stays alive in the lambda's
-    // capture until the thread function returns.
-    if (entry && entry->thread) entry->thread->detach();
+    std::lock_guard<std::mutex> lk(sessionsMu_);
+    auto it = sessions_.find(id);
+    if (it == sessions_.end()) return; // stop() owns this worker and will join
+    // Thread publication, detach and removal share one lock. The worker's
+    // capture keeps the entry alive until its function has returned.
+    it->second->thread.detach();
+    sessions_.erase(it);
 }
 
 void RelayServer::acceptLoop() {
@@ -153,37 +146,38 @@ void RelayServer::acceptLoop() {
                         params_.maxSessions);
                 continue;
             }
-        }
 
-        uint64_t id = nextSessionId_++;
-        auto entry = std::make_shared<RelayEntry>();
-        entry->session = std::make_shared<RelaySession>(id, app, appPeer,
-                                                        std::move(*target), params_);
-        {
-            std::lock_guard<std::mutex> lk(sessionsMu_);
+            uint64_t id = nextSessionId_++;
+            auto entry = std::make_shared<RelayEntry>();
+            // Copy endpoint, credentials and timeouts as one config snapshot.
+            entry->session = std::make_shared<RelaySession>(id, app, appPeer,
+                                                            std::move(*target), params_);
             sessions_.emplace(id, entry);
-        }
-        entry->thread = std::make_shared<std::thread>([this, entry]() {
-            RelaySession& s = *entry->session;
-            s.run([this](RelaySession& done) {
-                if (done.ok()) {
-                    counters.completed.fetch_add(1);
-                } else if (done.failureKind() == RelayFailureKind::Aborted) {
-                    counters.aborted.fetch_add(1);
-                } else {
-                    counters.socksFail.fetch_add(1);
-                }
-                // Engine's real-traffic failure signal (the relay thread
-                // reports; the node monitor consumes). Never block here:
-                // the callback only touches small mutex-guarded state.
-                const RelayTarget& t = done.target();
-                if (t.onResult) {
-                    t.onResult(t.outletId, t.origDst.ip, t.origDst.port,
-                               done.ok(), done.failureKind(), done.error());
-                }
+            // A fast EOF/failure may finish before the constructor returns.
+            // Keep the lock until its std::thread has been published.
+            entry->thread = std::thread([this, entry]() {
+                RelaySession& s = *entry->session;
+                s.run([this](RelaySession& done) {
+                    if (done.ok()) {
+                        counters.completed.fetch_add(1);
+                    } else if (done.failureKind() == RelayFailureKind::Aborted) {
+                        counters.aborted.fetch_add(1);
+                    } else {
+                        counters.socksFail.fetch_add(1);
+                    }
+                    // Engine's real-traffic failure signal (the relay thread
+                    // reports; the node monitor consumes). Never block here:
+                    // the callback only touches small mutex-guarded state.
+                    const RelayTarget& t = done.target();
+                    if (t.onResult) {
+                        t.onResult(t.outletId, t.origDst.ip, t.origDst.port,
+                                   done.ok(), done.failureKind(), done.error(),
+                                   done.effectiveDomain());
+                    }
+                });
+                reapSession(s.id());
             });
-            reapSession(s.id());
-        });
+        }
     }
 }
 

@@ -304,9 +304,6 @@ private:
     // reports the dead port explicitly).
     uint16_t resolveDefaultSocksPort(const Config& cfg);
     std::string resolveRuleOutlet(const std::string& ruleOutlet) const;
-    net::Endpoint4 outletEndpoint(const std::string& id) const;
-    std::string outletUsername(const std::string& id) const;
-    std::string outletPassword(const std::string& id) const;
     void rebuildHealthMonitors(const Config& cfg);
 
     std::string buildStatusJson() const;
@@ -480,6 +477,7 @@ private:
         int32_t fails = 0;
         uint32_t lastFailIp = 0;
         uint16_t lastFailPort = 0;
+        std::string lastFailDomain;
         int64_t lastFailMs = 0;
         int64_t lastAutoRoundMs = 0;  // gates self-triggered rounds
         // Whether lastFailIp was in OUR injected-clean DNS cache at failure
@@ -496,7 +494,8 @@ private:
     std::map<std::string, FlowSignal> flowSignals_;
     void onRelayResult(const std::string& outletId, uint32_t dstIp,
                        uint16_t dstPort, bool ok,
-                       RelayFailureKind failureKind, const std::string& err);
+                       RelayFailureKind failureKind, const std::string& err,
+                       const std::string& domain);
     bool flowFailsActive(const std::string& outletId,
                          const NodeMonitorSettings& nm) const;
     void clearFlowSignal(const std::string& outletId);

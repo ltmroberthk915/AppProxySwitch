@@ -220,18 +220,6 @@ RelayParams Engine::outletParams(const std::string& id) const {
     return it->second;
 }
 
-net::Endpoint4 Engine::outletEndpoint(const std::string& id) const {
-    return outletParams(id).proxy;
-}
-
-std::string Engine::outletUsername(const std::string& id) const {
-    return outletParams(id).username;
-}
-
-std::string Engine::outletPassword(const std::string& id) const {
-    return outletParams(id).password;
-}
-
 bool Engine::outletHealthy(const std::string& id) const {
     std::string key = outletEnabled(id) ? id : std::string(kDefaultOutletId);
     std::lock_guard<std::mutex> lk(const_cast<Engine*>(this)->healthMu_);
@@ -351,9 +339,12 @@ bool Engine::start(const Config& cfg, std::string* err) {
                            t.origDst = net::Endpoint4{entry->origDstIp, entry->origDstPort};
                            t.origSource = net::Endpoint4{entry->appIp, entry->appPort};
                            t.originalPid = entry->pid;
-                           t.proxy = outletEndpoint(entry->outletId);
-                           t.username = outletUsername(entry->outletId);
-                           t.password = outletPassword(entry->outletId);
+                           // A discovery/config reload may publish another
+                           // outlet table between individual field reads.
+                           const auto outlet = outletParams(entry->outletId);
+                           t.proxy = outlet.proxy;
+                           t.username = outlet.username;
+                           t.password = outlet.password;
                             t.ruleId = entry->ruleId;
                             t.outletId = entry->outletId;
                             t.sink = entry;
@@ -381,9 +372,10 @@ bool Engine::start(const Config& cfg, std::string* err) {
                                                     uint32_t dip,
                                                     uint16_t dport, bool ok,
                                                     RelayFailureKind failureKind,
-                                                    const std::string& err) {
+                                                    const std::string& err,
+                                                    const std::string& domain) {
                                     onRelayResult(oid, dip, dport, ok,
-                                                  failureKind, err);
+                                                  failureKind, err, domain);
                                 };
                             }
                             return t;
@@ -1772,7 +1764,7 @@ json::Value Engine::kernelsJson() const {
 void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
                            uint16_t dstPort, bool ok,
                            RelayFailureKind failureKind,
-                           const std::string& err) {
+                           const std::string& err, const std::string& domain) {
     // Engine-initiated aborts are not a verdict on the egress.
     if (!ok && failureKind == RelayFailureKind::Aborted) return;
     if (!ok) {
@@ -1790,7 +1782,8 @@ void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
         // Application resets and internal/configuration failures say nothing
         // about either the local listener or the selected node. Tunnel
         // failures alone may feed the trusted real-traffic signal below.
-        if (failureKind != RelayFailureKind::Tunnel) return;
+        if (failureKind != RelayFailureKind::Tunnel &&
+            failureKind != RelayFailureKind::TlsNoResponse) return;
     }
     auto rt = runtime();
     if (!rt) return;
@@ -1814,12 +1807,14 @@ void Engine::onRelayResult(const std::string& outletId, uint32_t dstIp,
         } else {
             // Trust snapshot at failure time (the switch's cache flush
             // hasn't happened yet): only destinations WE resolved count.
-            const bool trusted = dnsCacheContainsIp(dstIp);
+            const bool trusted = dnsCacheContainsIp(dstIp) ||
+                (failureKind == RelayFailureKind::TlsNoResponse && !domain.empty());
             if (trusted) {
                 countedFailure = true;
                 s.fails++;
                 s.lastFailIp = dstIp;
                 s.lastFailPort = dstPort;
+                s.lastFailDomain = domain;
                 s.lastFailMs = now;
                 s.lastFailTrusted = true;
             }
@@ -1895,6 +1890,7 @@ void Engine::clearFlowSignal(const std::string& outletId) {
     it->second.fails = 0;
     it->second.lastFailIp = 0;
     it->second.lastFailPort = 0;
+    it->second.lastFailDomain.clear();
     it->second.lastFailMs = 0;
     it->second.lastFailTrusted = false;
     // windowStartMs / lastAutoRoundMs stay: they gate repeats, not verdicts.
@@ -1915,6 +1911,7 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
     uint32_t ip = 0;
     uint16_t port = 0;
     bool trusted = false;
+    std::string domain;
     {
         std::lock_guard<std::mutex> lk(flowSignalMu_);
         auto it = flowSignals_.find(outletId);
@@ -1926,6 +1923,7 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
         }
         ip = s.lastFailIp;
         port = s.lastFailPort;
+        domain = s.lastFailDomain;
         trusted = s.lastFailTrusted;
     }
     if (!trusted) {
@@ -1939,13 +1937,20 @@ Engine::VerifyOutcome Engine::verifySwitchWithRealTarget(
                 "the verdict", outletId, formatIpv4(ip), port);
         return VerifyOutcome::NoVerdict;
     }
-    net::Endpoint4 proxy = outletEndpoint(outletId);
-    if (proxy.port == 0) return VerifyOutcome::NoVerdict;
+    if (!domain.empty()) {
+        // Mihomo acknowledges CONNECT before dialing. Neither that ACK nor
+        // the app's original (possibly polluted) IP can confirm TLS recovery.
+        // Keep the signal; subsequent real traffic supplies the verdict.
+        log::ifmt("node monitor [{}]: awaiting real TLS traffic for {}; "
+                  "SOCKS acceptance cannot confirm recovery", outletId, domain);
+        return VerifyOutcome::NoVerdict;
+    }
+    const auto outlet = outletParams(outletId);
+    if (outlet.proxy.port == 0) return VerifyOutcome::NoVerdict;
     std::string err;
     SOCKET s = INVALID_SOCKET;
     const int timeoutMs = std::min(cfg.nodeMonitor.delayTimeoutMs, 3000);
-    if (!Socks5Client::connect(proxy, outletUsername(outletId),
-                               outletPassword(outletId),
+    if (!Socks5Client::connect(outlet.proxy, outlet.username, outlet.password,
                                net::Endpoint4{ip, port}, timeoutMs, s, &err)) {
         log::df("node monitor [{}]: verification CONNECT to {}:{} failed: {}",
                 outletId, formatIpv4(ip), port, err);
@@ -1963,7 +1968,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
                               bool manualRound) {
     if (stopping_.load()) return;  // shutdown: don't start probe work
     // Monitoring measures this row even when it is not selected for routing.
-    // outletEndpoint() applies routing fallback and would stamp an inactive
+    // outletParams() applies routing fallback and would stamp an inactive
     // kernel's result with a different kernel's address.
     net::Endpoint4 endpoint{};
     if (const auto monitored = outlets_.load()) {
@@ -2200,6 +2205,17 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
         return;
     }
     for (const auto& g : allGroups) st.groupNodes[g.name] = g.nodes;
+    const bool allowNestedChoices = st.runtimeMode == "rule" &&
+        std::find(preferredGroups.begin(), preferredGroups.end(), group->name) != preferredGroups.end();
+    auto concreteChoice = [&](const std::string& member) -> std::optional<std::string> {
+        if (isPseudoNodeName(member)) return std::nullopt;
+        const bool nested = st.groupNodes.count(member) != 0;
+        if (nested && !allowNestedChoices) return std::nullopt;
+        const auto leaf = group->memberLeaves.find(member);
+        const auto& node = leaf == group->memberLeaves.end() ? member : leaf->second;
+        if (st.groupNodes.count(node) || isPseudoNodeName(node)) return std::nullopt;
+        return node;
+    };
     // AUTO-INFER region from group names: a group whose own name carries a
     // region signal (e.g. "香港节点") teaches that region to every member
     // node — including transitively referenced sub-groups. Opaque node
@@ -2232,7 +2248,6 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     st.apiError.clear();
     st.selectionSatisfied = true;
     const bool sameGroup = st.group == group->name;
-    const bool sameNode = sameGroup && st.node == group->now;
     if (!sameGroup) {
         log::ifmt("node monitor [{}]: scope changed from '{}' to '{}' (mode={})",
                   outletId, st.group, group->name, st.runtimeMode);
@@ -2255,7 +2270,6 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
             st.group + "」；其他业务出口及 HTTP/WSS 流完整性未验证";
     }
     st.region = regionOfNode(st.node);
-    const int previousLatencyMs = st.latencyMs;
     const int controllerLatencyMs =
         client.nodeDelay(group->now, nm.delayUrl, nm.delayTimeoutMs,
                          nm.delayTimeoutMs + 3000);
@@ -2263,11 +2277,6 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     const bool tunnelHealthy = outletHealthy(outletId);
     if (controllerProbeAlive) {
         st.latencyMs = controllerLatencyMs;
-    } else if (tunnelHealthy && sameNode) {
-        // Preserve the last useful figure for this same node. Publishing -1 on one failed
-        // controller request made a genuinely healthy tunnel look dead in
-        // the UI and helped prompt unnecessary manual switching.
-        st.latencyMs = previousLatencyMs;
     } else {
         st.latencyMs = -1;
     }
@@ -2278,8 +2287,10 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     // failure, and a failed real tunnel is authoritative in either mode.
     st.alive = tunnelHealthy && (controllerProbeAlive || !manualRound);
     if (!controllerProbeAlive && tunnelHealthy && !manualRound) {
-        log::df("node monitor [{}]: controller delay failed for {}, but the "
-                "real tunnel is healthy; keeping the node",
+        st.selectionSatisfied = false;
+        st.routingWarning += "；当前测速失败，业务可达性待确认";
+        log::df("node monitor [{}]: controller delay failed for {}; "
+                "local SOCKS accepts requests, TLS reachability unverified",
                 outletId, group->now);
     } else if (controllerProbeAlive && !tunnelHealthy) {
         log::wf("node monitor [{}]: {} passes controller delay ({}ms), but "
@@ -2335,8 +2346,9 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
             !region::matchesAny(regionOfNode(st.node), wantRegions)) {
             bool anyInRegion = false;
             for (const auto& n : group->nodes) {
-                if (st.groupNodes.count(n) || isPseudoNodeName(n)) continue;
-                if (region::matchesAny(regionOfNode(n), wantRegions)) {
+                const auto leaf = concreteChoice(n);
+                if (!leaf) continue;
+                if (region::matchesAny(regionOfNode(*leaf), wantRegions)) {
                     anyInRegion = true;
                     break;
                 }
@@ -2428,9 +2440,8 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
         if (!st.classUnavailable && !classMatches(st.node)) {
             bool anyInClass = false;
             for (const auto& n : group->nodes) {
-                if (st.groupNodes.count(n)) continue;      // sub-group
-                if (isPseudoNodeName(n)) continue;         // DIRECT et al.
-                if (classMatches(n)) { anyInClass = true; break; }
+                const auto leaf = concreteChoice(n);
+                if (leaf && classMatches(*leaf)) { anyInClass = true; break; }
             }
             if (!anyInClass) {
                 st.classUnavailable = true;
@@ -2549,6 +2560,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     // entries).
     const int probeTimeout = std::min(nm.delayTimeoutMs, 2000);
     struct ProbeResult {
+        std::string selection; // legal immediate member used by PUT
         std::string node;
         int latency;
         std::string region;  // detected region ("" = unknown)
@@ -2563,23 +2575,21 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     auto collectCandidates = [&](bool ignoreCooldowns) {
         candidates.clear();
         cooldownSkipped = false;
+        std::set<std::string> seen{group->now};
         for (const auto& n : group->nodes) {
-            if (n == group->now) continue;
-            // Group NAMES may appear inside a selector's member list (measured:
-            // xmrth's GLOBAL lists 🍎苹果服务/🔰国外流量 alongside nodes). A
-            // group is a FILTER dimension, never a selectable node — skipping
-            // them here stops the engine from "switching" to a group name.
-            if (st.groupNodes.count(n)) continue;
-            // Built-in pseudo-proxies (DIRECT...) never count as candidates.
-            if (isPseudoNodeName(n)) continue;
+            const auto leaf = concreteChoice(n);
+            if (!leaf || !seen.insert(*leaf).second) continue;
+            // Explicit rule-service selectors may legally select a child
+            // branch at its existing leaf. General/global groups keep their
+            // previous concrete-node policy; child selections stay untouched.
             // An explicit filtered test must not silently pick a node from
             // another region/type. Timed recovery keeps its soft fallback.
-            if (manualRound && (!region::matchesAny(regionOfNode(n), wantRegions) || !classMatches(n))) continue;
+            if (manualRound && (!region::matchesAny(regionOfNode(*leaf), wantRegions) || !classMatches(*leaf))) continue;
             // A node that failed the post-switch real-CONNECT verification
             // is excluded for its cooldown (the retry loop then walks the
             // rest of the list instead of re-picking it).
             if (!ignoreCooldowns &&
-                nodeInBadCooldown(outletId, n, nowMs())) {
+                nodeInBadCooldown(outletId, *leaf, nowMs())) {
                 cooldownSkipped = true;
                 continue;
             }
@@ -2605,14 +2615,17 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
             while (true) {
                 size_t i = next.fetch_add(1);
                 if (i >= candidates.size()) break;
-                int lat = client.nodeDelay(candidates[i], nm.delayUrl,
+                const auto leaf = concreteChoice(candidates[i]);
+                if (!leaf) continue;
+                int lat = client.nodeDelay(*leaf, nm.delayUrl,
                                            probeTimeout, probeTimeout);
                 ProbeResult pr;
-                pr.node = candidates[i];
+                pr.selection = candidates[i];
+                pr.node = *leaf;
                 pr.latency = lat;
-                pr.region = regionOfNode(candidates[i]);
-                pr.inClass = classMatches(candidates[i]);
-                auto history = group->history.find(candidates[i]);
+                pr.region = regionOfNode(pr.node);
+                pr.inClass = classMatches(pr.node);
+                auto history = group->history.find(pr.node);
                 if (history != group->history.end()) {
                     pr.historySuccesses = history->second.successes;
                     pr.historySamples = history->second.samples;
@@ -2627,6 +2640,7 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     if (manualRound && !dead && !realFail && st.latencyMs >= 0 &&
         region::matchesAny(regionOfNode(st.node), wantRegions) && classMatches(st.node)) {
         ProbeResult current;
+        current.selection = group->selectedMember;
         current.node = st.node;
         current.latency = st.latencyMs;
         current.region = regionOfNode(st.node);
@@ -2750,7 +2764,20 @@ void Engine::monitorOneOutlet(const Config& cfg, const std::string& outletId,
     }
     st.switching = false;  // the round ends with this store
     std::string swErr;
-    if (client.switchNode(group->name, chosen->node, &swErr)) {
+    if (client.switchNode(group->name, chosen->selection, &swErr)) {
+        if (chosen->selection != chosen->node) {
+            std::string currentMode;
+            const auto verified = client.currentSelectorGroup(&swErr, 3000, nullptr,
+                                                              &currentMode, preferredGroups);
+            if (!verified || verified->name != group->name || currentMode != "rule" ||
+                verified->now != chosen->node) {
+                st.selectionSatisfied = false;
+                st.lastSwitchDetail = "嵌套策略选择在探测期间改变，实际出口待下一轮核对";
+                log::wf("node monitor [{}]: nested member {} changed during selection verification",
+                        outletId, chosen->selection);
+                return;
+            }
+        }
         st.lastSwitchDetail = group->now + " -> " + chosen->node + " (" +
                               std::to_string(chosen->latency) + "ms)";
         if (outOfRegion && !dead && !tooSlow) {
@@ -3808,10 +3835,15 @@ void Engine::handleTcpPacket(uint8_t* buf, size_t len, const PacketMeta& meta) {
         device_->sendLastTcp(buf, len, false);
         return;
     }
-    log::df("pkt {}:{} -> {}:{} syn={} ack={} fin={} rst={} len={} lb={} if={}",
-            formatIpv4(p.srcIp), p.srcPort, formatIpv4(p.dstIp), p.dstPort, p.syn ? 1 : 0,
-            p.ackFlag ? 1 : 0, p.fin ? 1 : 0, p.rst ? 1 : 0, p.payloadLen,
-            meta.loopback ? 1 : 0, meta.ifIdx);
+    // Data/ACK packets can arrive faster than the rotating log can retain
+    // critical flow outcomes. Keep control transitions, while byte counters
+    // cover ordinary traffic without synchronously logging every packet.
+    if (p.syn || p.fin || p.rst) {
+        log::df("pkt {}:{} -> {}:{} syn={} ack={} fin={} rst={} len={} lb={} if={}",
+                formatIpv4(p.srcIp), p.srcPort, formatIpv4(p.dstIp), p.dstPort, p.syn ? 1 : 0,
+                p.ackFlag ? 1 : 0, p.fin ? 1 : 0, p.rst ? 1 : 0, p.payloadLen,
+                meta.loopback ? 1 : 0, meta.ifIdx);
+    }
     int64_t now = nowMs();
 
     // Defensive 127/8 exclusion: the kernel filter only excludes the exact

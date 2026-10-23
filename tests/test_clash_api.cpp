@@ -165,6 +165,38 @@ APS_TEST(clashapi, preferred_rule_selector_retains_outer_target_and_resolves_nes
         EXPECT_STREQ(group->now, "node-b");
         EXPECT_EQ(group->nodes.size(), 1u);
         EXPECT_STREQ(group->nodes.front(), "Automatic");
+        EXPECT_STREQ(group->selectedMember, "Automatic");
+        EXPECT_STREQ(group->memberLeaves.at("Automatic"), "node-b");
+    }
+    EXPECT_TRUE(api.switches().empty());
+}
+
+APS_TEST(clashapi, preferred_selector_maps_legal_choices_without_flattening_invalid_branches) {
+    MockClashApi api;
+    api.mode = "rule";
+    api.groups = {{"Service", {"US relay", "Shared", "Cycle", "Empty", "DIRECT"}},
+                  {"Shared", {"Automatic", "JP relay"}},
+                  {"Automatic", {"SG IEPL", "JP relay"}},
+                  {"Cycle", {"Service"}}, {"Empty", {"SG IEPL"}}};
+    api.groupTypes["Automatic"] = "URLTest";
+    api.groupSelections = {{"Service", "US relay"}, {"Shared", "Automatic"},
+                           {"Automatic", "SG IEPL"}, {"Cycle", "Service"}, {"Empty", ""}};
+    api.rulePolicies = {"Service"};
+    EXPECT_TRUE(api.start());
+    ClashApiClient client("127.0.0.1", api.port(), "");
+    std::string error;
+    auto group = client.currentSelectorGroup(&error, 1500, nullptr, nullptr, {"Service"});
+    EXPECT_TRUE(group.has_value());
+    if (group) {
+        EXPECT_STREQ(group->now, "US relay");
+        EXPECT_STREQ(group->selectedMember, "US relay");
+        EXPECT_STREQ(group->memberLeaves.at("US relay"), "US relay");
+        EXPECT_STREQ(group->memberLeaves.at("Shared"), "SG IEPL");
+        EXPECT_TRUE(group->memberLeaves.count("Cycle") == 0);
+        EXPECT_TRUE(group->memberLeaves.count("Empty") == 0);
+        EXPECT_TRUE(group->memberLeaves.count("JP relay") == 0);
+        EXPECT_STREQ(group->memberLeaves.at("DIRECT"), "DIRECT");
+        EXPECT_EQ(group->nodes.size(), 5u);
     }
     EXPECT_TRUE(api.switches().empty());
 }

@@ -31,6 +31,7 @@ enum class MockSocksBehavior {
     AcceptConnect,   // reply success without dialing a target; hold the tunnel
     EchoConnect,     // acknowledge and echo bytes; no upstream network/DNS
     Silence,         // never reply (drives client timeouts)
+    CloseAfterData,  // CONNECT accepted, then EOF with no response bytes
 };
 
 struct MockSocksRequest {
@@ -259,7 +260,8 @@ private:
             return bail(false);
         }
         if (behavior_ == MockSocksBehavior::AcceptConnect ||
-            behavior_ == MockSocksBehavior::EchoConnect) {
+            behavior_ == MockSocksBehavior::EchoConnect ||
+            behavior_ == MockSocksBehavior::CloseAfterData) {
             // A deterministic tunnel for relay pump tests: acknowledge the
             // CONNECT without touching the network, then wait until the
             // relay closes its proxy-side socket.
@@ -270,6 +272,10 @@ private:
                 int n = net::recvSome(c, buf, sizeof(buf), 200);
                 if (n == -2) continue;
                 if (n <= 0) break;
+                if (behavior_ == MockSocksBehavior::CloseAfterData) {
+                    Sleep(50);  // allow an application's earlier FIN to be observed
+                    break;
+                }
                 if (behavior_ == MockSocksBehavior::EchoConnect &&
                     net::sendAll(c, buf, static_cast<size_t>(n), 2000) != 0) break;
             }

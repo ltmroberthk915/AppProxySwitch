@@ -1,6 +1,7 @@
 #include "aps/log.hpp"
 #include "aps/pipe.hpp"
 #include "aps/protocol.hpp"
+#include "pipe_io.hpp"
 
 namespace aps::ipc {
 
@@ -9,6 +10,7 @@ void PipeClient::start(const std::wstring& name, MsgHandler onMsg, StateHandler 
     onMsg_ = std::move(onMsg);
     onState_ = std::move(onState);
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    resetEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     stopping_.store(false);
     thread_ = std::thread([this] { run(); });
 }
@@ -20,13 +22,19 @@ void PipeClient::stop() {
         std::lock_guard<std::mutex> lk(writeMu_);
         if (pipe_ != INVALID_HANDLE_VALUE) {
             CancelIoEx(pipe_, nullptr);
-            CloseHandle(pipe_);
-            pipe_ = INVALID_HANDLE_VALUE;
         }
     }
     if (thread_.joinable()) thread_.join();
+    {
+        std::lock_guard<std::mutex> lk(writeMu_);
+        if (pipe_ != INVALID_HANDLE_VALUE) CloseHandle(pipe_);
+        pipe_ = INVALID_HANDLE_VALUE;
+        connected_.store(false);
+    }
     if (stopEvent_) CloseHandle(stopEvent_);
     stopEvent_ = nullptr;
+    if (resetEvent_) CloseHandle(resetEvent_);
+    resetEvent_ = nullptr;
 }
 
 void PipeClient::run() {
@@ -41,26 +49,28 @@ void PipeClient::run() {
         }
         DWORD mode = PIPE_READMODE_BYTE;
         SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
-        pipe_ = pipe;
-        connected_.store(true);
+        {
+            std::lock_guard<std::mutex> lk(writeMu_);
+            if (stopping_.load()) {
+                CloseHandle(pipe);
+                break;
+            }
+            ResetEvent(resetEvent_);
+            pipe_ = pipe;
+            connected_.store(true);
+        }
         if (onState_) onState_(true);
 
         char buf[8192];
         OVERLAPPED rov{};
         rov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         pending.clear();
-        while (!stopping_.load()) {
+        while (rov.hEvent && !stopping_.load() && connected_.load()) {
             DWORD got = 0;
             ResetEvent(rov.hEvent);
             BOOL ok = ReadFile(pipe, buf, sizeof(buf), &got, &rov);
             if (!ok && GetLastError() == ERROR_IO_PENDING) {
-                HANDLE waits[2] = {rov.hEvent, stopEvent_};
-                DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-                if (w == WAIT_OBJECT_0 + 1) {
-                    CancelIoEx(pipe, nullptr);
-                    break;
-                }
-                ok = GetOverlappedResult(pipe, &rov, &got, FALSE);
+                ok = detail::awaitPending(pipe, rov, stopEvent_, INFINITE, got, resetEvent_);
             }
             if (!ok || got == 0) break;  // server gone
             pending.append(buf, got);
@@ -80,7 +90,7 @@ void PipeClient::run() {
             if (start > 0) pending.erase(0, start);
             if (pending.size() > kMaxLine) pending.clear();
         }
-        CloseHandle(rov.hEvent);
+        if (rov.hEvent) CloseHandle(rov.hEvent);
         connected_.store(false);
         {
             std::lock_guard<std::mutex> lk(writeMu_);
@@ -95,22 +105,22 @@ void PipeClient::run() {
 }
 
 bool PipeClient::sendLine(const std::string& line) {
-    if (!connected_.load()) return false;
+    if (stopping_.load() || !connected_.load()) return false;
     std::lock_guard<std::mutex> lk(writeMu_);
-    if (pipe_ == INVALID_HANDLE_VALUE) return false;
+    if (stopping_.load() || !connected_.load() || pipe_ == INVALID_HANDLE_VALUE) return false;
     std::string data = line;
     if (data.empty() || data.back() != '\n') data.push_back('\n');
     if (data.size() > kMaxLine) return false;
-    OVERLAPPED wov{};
-    wov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    DWORD written = 0;
-    BOOL ok = WriteFile(pipe_, data.data(), static_cast<DWORD>(data.size()), &written,
-                        &wov);
-    if (!ok && GetLastError() == ERROR_IO_PENDING) {
-        ok = GetOverlappedResult(pipe_, &wov, &written, TRUE);
+    if (!detail::writeBounded(pipe_, stopEvent_, data)) {
+        // A cancelled byte-mode write may have delivered a prefix. Reconnect
+        // before another line so a later command cannot complete that prefix.
+        connected_.store(false);
+        // Keep the reset observable if the reader has not issued ReadFile yet.
+        SetEvent(resetEvent_);
+        CancelIoEx(pipe_, nullptr);
+        return false;
     }
-    CloseHandle(wov.hEvent);
-    return ok && written == data.size();
+    return true;
 }
 
 }  // namespace aps::ipc

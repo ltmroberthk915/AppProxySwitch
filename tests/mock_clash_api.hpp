@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "aps/net.hpp"
+#include "aps/clash_api.hpp"
 #include "aps/json.hpp"
 
 namespace aps::test {
@@ -182,6 +183,7 @@ private:
             return;
         }
         if (path == "/proxies") {
+            std::unique_lock<std::mutex> selectionLock(mu_);
             auto esc = [](const std::string& s) {
                 std::string o;
                 for (char c : s) {
@@ -229,6 +231,7 @@ private:
                 body += "]}";
             }
             body += "}}";
+            selectionLock.unlock();
             respond(c, "200 OK", body);
             return;
         }
@@ -323,6 +326,9 @@ private:
                 std::lock_guard<std::mutex> lk(mu_);
                 switches_.push_back(group + "::" + node);
                 if (!node.empty()) selectorNow = node;
+                for (const auto& entry : groups)
+                    if (ClashApiClient::urlEncode(entry.first) == group && !node.empty())
+                        groupSelections[entry.first] = node;
             }
             respond(c, "204 No Content", "");
             return;

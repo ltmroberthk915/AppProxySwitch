@@ -35,6 +35,12 @@ struct ClashGroup {
     std::string now;      // currently selected node (may be empty)
     std::vector<std::string> nodes;
     std::map<std::string, ClashNodeHistory> history;
+    // Original legal selector member, before following its selected leaf.
+    std::string selectedMember;
+    // Each immediate legal member's current leaf, following existing child
+    // selections only. Invalid/cyclic branches are absent. Choosing a member
+    // never requires editing the child selector or its other routes.
+    std::map<std::string, std::string> memberLeaves;
 };
 
 class ClashApiClient {

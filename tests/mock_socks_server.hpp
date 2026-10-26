@@ -27,6 +27,7 @@ enum class MockSocksBehavior {
     FailGreeting,    // send garbage after connect
     NoAcceptable,    // reply 05 FF
     FailAuth,        // require auth, then reject
+    ResetAuthReply,  // require auth, then reset without a protocol reply
     RefuseConnect,   // reply rep != 0
     AcceptConnect,   // reply success without dialing a target; hold the tunnel
     EchoConnect,     // acknowledge and echo bytes; no upstream network/DNS
@@ -112,6 +113,8 @@ public:
 
     uint16_t port() const { return port_; }
     net::Endpoint4 endpoint() const { return net::Endpoint4{0x7F000001, port_}; }
+    // Lets wire-level tests read only after the server has closed its socket.
+    size_t completedConnectionCount() const { return completedConnections_.load(); }
 
     size_t requestCount() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -141,7 +144,10 @@ private:
             SOCKET c = accept(listener_, reinterpret_cast<sockaddr*>(&peer), &plen);
             if (c == INVALID_SOCKET) break;
             track(c);
-            std::thread t([this, c] { serve(c); });
+            std::thread t([this, c] {
+                serve(c);
+                ++completedConnections_;
+            });
             std::lock_guard<std::mutex> lk(mu_);
             clientThreads_.push_back(std::move(t));
         }
@@ -167,7 +173,7 @@ private:
         if (head[0] != 0x05) {
             unsigned char junk[2] = {0x00, 0x00};
             net::sendAll(c, reinterpret_cast<char*>(junk), 2, 1000);  // FailGreeting-ish
-            return bail(true);
+            return bail(false);
         }
         int nmethods = head[1];
         unsigned char methods[16];
@@ -178,17 +184,23 @@ private:
         if (behavior_ == MockSocksBehavior::FailGreeting) {
             unsigned char junk[2] = {0x99, 0x99};
             net::sendAll(c, reinterpret_cast<char*>(junk), 2, 1000);
-            return bail(true);
+            return bail(false);
+        }
+        if (behavior_ == MockSocksBehavior::NoAcceptable) {
+            unsigned char r[2] = {0x05, 0xFF};
+            net::sendAll(c, reinterpret_cast<char*>(r), 2, 1000);
+            return bail(false);
         }
         bool clientOfferedAuth = false;
         for (int i = 0; i < nmethods; ++i) {
             if (methods[i] == 0x02) clientOfferedAuth = true;
         }
-        if (requireAuth_ || (behavior_ == MockSocksBehavior::FailAuth)) {
+        if (requireAuth_ || behavior_ == MockSocksBehavior::FailAuth ||
+            behavior_ == MockSocksBehavior::ResetAuthReply) {
             if (!clientOfferedAuth) {
                 unsigned char r[2] = {0x05, 0xFF};
                 net::sendAll(c, reinterpret_cast<char*>(r), 2, 1000);
-                return bail(true);
+                return bail(false);
             }
             unsigned char r[2] = {0x05, 0x02};
             net::sendAll(c, reinterpret_cast<char*>(r), 2, 1000);
@@ -200,23 +212,20 @@ private:
             if (net::recvExact(c, reinterpret_cast<char*>(&pl), 1, 5000) != 1) return bail(false);
             pass.resize(pl);
             if (pl && net::recvExact(c, pass.data(), pl, 5000) != pl) return bail(false);
+            if (behavior_ == MockSocksBehavior::ResetAuthReply) return bail(true);
             bool authOk = (behavior_ != MockSocksBehavior::FailAuth) &&
                           user == authUser_ && pass == authPass_;
             unsigned char ar[2] = {0x01, static_cast<unsigned char>(authOk ? 0x00 : 0x01)};
             net::sendAll(c, reinterpret_cast<char*>(ar), 2, 1000);
-            if (!authOk) return bail(true);
+            // Keep the rejection queued for the client. An abortive close
+            // can discard it and turn a credential failure into a reset.
+            if (!authOk) return bail(false);
             lastUser_ = user;  // recorded below with the request
             pendingUser_ = user;
             pendingPass_ = pass;
         } else {
             unsigned char r[2] = {0x05, 0x00};
             net::sendAll(c, reinterpret_cast<char*>(r), 2, 1000);
-        }
-        if (behavior_ == MockSocksBehavior::NoAcceptable) {
-            // (already answered above if we got here with requireAuth off)
-            unsigned char r[2] = {0x05, 0xFF};
-            net::sendAll(c, reinterpret_cast<char*>(r), 2, 1000);
-            return bail(true);
         }
         // --- CONNECT ----------------------------------------------------------
         unsigned char req[4];
@@ -332,6 +341,7 @@ private:
     std::thread thread_;
     std::vector<std::thread> clientThreads_;
     std::atomic<bool> stopping_{false};
+    std::atomic<size_t> completedConnections_{0};
     uint16_t port_ = 0;
     MockSocksBehavior behavior_ = MockSocksBehavior::Normal;
     bool requireAuth_ = false;

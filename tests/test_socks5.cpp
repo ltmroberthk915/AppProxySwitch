@@ -78,9 +78,95 @@ APS_TEST(socks5, wrong_password_rejected) {
                                     &failure);
     EXPECT_FALSE(ok);
     EXPECT_TRUE(s == INVALID_SOCKET);
-    EXPECT_TRUE(err.find("rejected") != std::string::npos || !err.empty());
+    EXPECT_STREQ(err, "SOCKS5: username/password rejected");
     EXPECT_EQ(static_cast<int>(failure),
               static_cast<int>(Socks5FailureKind::Configuration));
+    srv.stop();
+    EXPECT_EQ(srv.requestCount(), 0u);
+}
+
+APS_TEST(socks5, rejection_reply_survives_server_close) {
+    // A slow reader must receive the protocol rejection followed by EOF.
+    // Waiting for the worker to finish fixes the ordering without a timing
+    // guess: the old reply-then-RST mock fails even if send() succeeded.
+    struct Scenario {
+        MockSocksBehavior behavior;
+        bool offerAuth;
+        bool sendAuth;
+        bool validVersion;
+        unsigned char expectedVersion;
+        unsigned char expectedStatus;
+    };
+    const Scenario scenarios[] = {
+        {MockSocksBehavior::Normal, true, true, true, 0x01, 0x01},
+        {MockSocksBehavior::FailAuth, true, true, true, 0x01, 0x01},
+        {MockSocksBehavior::Normal, false, false, true, 0x05, 0xFF},
+        {MockSocksBehavior::NoAcceptable, true, false, true, 0x05, 0xFF},
+        {MockSocksBehavior::FailGreeting, true, false, true, 0x99, 0x99},
+        {MockSocksBehavior::Normal, false, false, false, 0x00, 0x00},
+    };
+    for (const auto& scenario : scenarios) {
+        std::printf("    rejection behavior=%d auth=%d version=%d\n",
+                    static_cast<int>(scenario.behavior), scenario.sendAuth,
+                    scenario.validVersion);
+        MockSocks5Server srv;
+        srv.setBehavior(scenario.behavior);
+        srv.setRequireAuth(true, "alice", "secret");
+        EXPECT_TRUE(srv.start());
+        SOCKET s = net::makeTcpSocket();
+        EXPECT_TRUE(s != INVALID_SOCKET);
+        const int connected = net::connectWithTimeout(s, srv.endpoint(), 3000, nullptr);
+        EXPECT_EQ(connected, 0);
+        if (connected != 0) { net::closeSocket(s); continue; }
+        const unsigned char greeting[] = {
+            static_cast<unsigned char>(scenario.validVersion ? 5 : 4),
+            static_cast<unsigned char>(scenario.offerAuth ? 2 : 1), 0, 2};
+        const size_t greetingLength = !scenario.validVersion ? 2 : scenario.offerAuth ? 4 : 3;
+        const int greetingSent = net::sendAll(s, reinterpret_cast<const char*>(greeting),
+                                             greetingLength, 3000);
+        EXPECT_EQ(greetingSent, 0);
+        if (scenario.sendAuth) {
+            unsigned char method[2]{};
+            const int methodRead = net::recvExact(s, reinterpret_cast<char*>(method), 2, 3000);
+            EXPECT_EQ(methodRead, 2);
+            EXPECT_EQ(method[0], 5);
+            EXPECT_EQ(method[1], 2);
+            const unsigned char auth[] = {
+                1, 5, 'a', 'l', 'i', 'c', 'e', 5, 'w', 'r', 'o', 'n', 'g'};
+            const int authSent = net::sendAll(s, reinterpret_cast<const char*>(auth), sizeof(auth), 3000);
+            EXPECT_EQ(authSent, 0);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (srv.completedConnectionCount() == 0 &&
+               std::chrono::steady_clock::now() < deadline) Sleep(1);
+        EXPECT_EQ(srv.completedConnectionCount(), 1u);
+        unsigned char reply[2]{};
+        const int replyRead = net::recvExact(s, reinterpret_cast<char*>(reply), 2, 3000);
+        EXPECT_EQ(replyRead, 2);
+        EXPECT_EQ(static_cast<int>(reply[0]), static_cast<int>(scenario.expectedVersion));
+        EXPECT_EQ(static_cast<int>(reply[1]), static_cast<int>(scenario.expectedStatus));
+        char extra = 0;
+        const int eofRead = net::recvSome(s, &extra, 1, 3000);
+        EXPECT_EQ(eofRead, 0);  // FIN, no reset or extra reply
+        net::closeSocket(s);
+        srv.stop();
+        EXPECT_EQ(srv.requestCount(), 0u);
+    }
+}
+
+APS_TEST(socks5, auth_reply_reset_is_endpoint_failure) {
+    MockSocks5Server srv;
+    srv.setBehavior(MockSocksBehavior::ResetAuthReply);
+    EXPECT_TRUE(srv.start());
+    SOCKET s = INVALID_SOCKET;
+    std::string err;
+    Socks5FailureKind failure = Socks5FailureKind::None;
+    const bool ok = Socks5Client::connect(srv.endpoint(), "alice", "wrong",
+        net::Endpoint4{0x7F000001, 80}, 3000, s, &err, &failure);
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(s == INVALID_SOCKET);
+    EXPECT_STREQ(err, "SOCKS5: auth reply timed out or malformed");
+    EXPECT_EQ(static_cast<int>(failure), static_cast<int>(Socks5FailureKind::ProxyEndpoint));
     srv.stop();
     EXPECT_EQ(srv.requestCount(), 0u);
 }

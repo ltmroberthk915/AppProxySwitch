@@ -1,6 +1,6 @@
 # AppProxySwitch
 
-**1.3.9 prerelease candidate:** External replies use explicit inbound injection and each flow's original interface. Native loopback keeps its original path, and synthesized resets no longer borrow cross-thread receive metadata. Incident causality and accelerator coexistence remain unverified. See [release notes](docs/RELEASE-1.3.9-TCP-RETURN-PATH.md).
+**1.3.9:** External replies use explicit inbound injection and each flow's original interface. Native loopback keeps its original path, and synthesized resets no longer borrow cross-thread receive metadata. Incident causality and accelerator coexistence remain unverified. See [release notes](docs/RELEASE-1.3.9-TCP-RETURN-PATH.md).
 
 The **1.3.7 GUI hotfix candidate** replaces the 1.3.6 GUI candidate. It removes intermediate control resets during status refresh, batches final rectangles and skips unchanged layout/text while preserving live counters. See [release notes](docs/RELEASE-1.3.7-REFRESH-JITTER.md) and [validation](docs/VALIDATION-1.3.7.md).
 

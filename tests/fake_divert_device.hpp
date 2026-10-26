@@ -231,6 +231,12 @@ public:
         cvSent_.notify_all();
         return true;
     }
+    bool sendTcpPacket(const uint8_t* buf, size_t len, const PacketMeta& meta) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        sent_.push_back(Sent{std::vector<uint8_t>(buf, buf + len), meta, false});
+        cvSent_.notify_all();
+        return true;
+    }
     bool sendLastUdp(const uint8_t* buf, size_t len) override {
         PacketMeta m = lastUdpMeta_;
         std::lock_guard<std::mutex> lk(mu_);
@@ -282,12 +288,9 @@ public:
         (void)meta;
         return sendLastDns(buf, len);
     }
-    bool sendSyntheticTcp(const uint8_t* buf, size_t len, bool loopback) override {
-        PacketMeta m;
-        m.outbound = true;
-        m.loopback = loopback;
+    bool sendSyntheticTcp(const uint8_t* buf, size_t len, const PacketMeta& meta) override {
         std::lock_guard<std::mutex> lk(mu_);
-        sent_.push_back(Sent{std::vector<uint8_t>(buf, buf + len), m, true});
+        sent_.push_back(Sent{std::vector<uint8_t>(buf, buf + len), meta, true});
         cvSent_.notify_all();
         return true;
     }

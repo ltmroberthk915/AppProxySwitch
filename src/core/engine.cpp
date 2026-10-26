@@ -647,7 +647,7 @@ void Engine::sendTeardownRst(const std::shared_ptr<NatEntry>& e) {
     uint32_t seq = e->seqValid.load() ? e->nextSeqRelayToApp.load() : 0;
     size_t n = pkt::buildRst(e->origDstIp, e->origDstPort, e->appIp, e->appPort, seq,
                              /*withAck=*/true, 0, rst, sizeof(rst));
-    if (n > 0 && !device_->sendSyntheticTcp(rst, n, /*loopback=*/true)) {
+    if (n > 0 && !device_->sendSyntheticTcp(rst, n, e->returnPacketMeta())) {
         log::wf("failed to inject teardown RST for {}:{}",
                 formatIpv4(e->appIp), e->appPort);
     }
@@ -3873,7 +3873,10 @@ void Engine::handleTcpPacket(uint8_t* buf, size_t len, const PacketMeta& meta) {
             }
             pkt::rewriteSrc(p, entry->origDstIp, entry->origDstPort);
             pkt::recalcChecksums(buf, len);
-            device_->sendLastTcp(buf, len, /*forceLoopback=*/true);
+            // An external server's reply is inbound, even though this
+            // packet originated at our local relay. Outbound injection
+            // would re-enter connect filtering in other WFP drivers.
+            device_->sendTcpPacket(buf, len, entry->returnPacketMeta());
         } else {
             device_->sendLastTcp(buf, len, false);
         }
@@ -3966,7 +3969,7 @@ void Engine::handleTcpPacket(uint8_t* buf, size_t len, const PacketMeta& meta) {
                 return;
             }
             nat_.create(p.srcIp, p.srcPort, p.dstIp, p.dstPort, decision.ruleId,
-                        outletId, owner->pid, now, dnsBridge);
+                        outletId, owner->pid, now, dnsBridge, meta);
             stats_.connOpened(decision.ruleId, owner->pid);
             if (dnsBridge) {
                 log::df("TCP DNS bridge {}:{} -> {}:{} rule={}",

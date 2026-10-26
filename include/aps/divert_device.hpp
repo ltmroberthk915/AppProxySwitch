@@ -70,16 +70,24 @@ public:
     virtual bool sendDnsPacket(const uint8_t* buf, size_t len,
                                const PacketMeta& meta) = 0;
 
-    // Re-inject the packet last returned by recvNetworkTcp/Udp, optionally
-    // forcing the loopback flag (needed when the destination was rewritten to
-    // 127.0.0.1). The engine must re-inject EVERY packet it received.
+    // Re-inject the packet last returned by recvNetworkTcp/Udp with its
+    // original direction; forceLoopback describes the local forward rewrite.
+    // WinDivert ignores that flag on send; translated external replies must
+    // use sendTcpPacket with explicit inbound metadata instead.
     virtual bool sendLastTcp(const uint8_t* buf, size_t len, bool forceLoopback) = 0;
+    // Explicit metadata for translated replies. WinDivert ignores Loopback
+    // on injection: Outbound selects the path, and inbound needs the flow's
+    // original interface rather than the last local relay packet's interface.
+    // The caller must recalculate IP/TCP checksums before sending.
+    virtual bool sendTcpPacket(const uint8_t* buf, size_t len,
+                               const PacketMeta& meta) = 0;
     virtual bool sendLastUdp(const uint8_t* buf, size_t len) = 0;
     virtual bool sendLastTcp6(const uint8_t* buf, size_t len) = 0;
 
-    // Inject a synthesized packet (e.g., a teardown RST) that did not come
-    // from recv. loopback=true targets local delivery.
-    virtual bool sendSyntheticTcp(const uint8_t* buf, size_t len, bool loopback) = 0;
+    // Inject a synthesized packet (e.g., a teardown RST) without borrowing
+    // mutable receive-thread state. Checksums must already be valid.
+    virtual bool sendSyntheticTcp(const uint8_t* buf, size_t len,
+                                  const PacketMeta& meta) = 0;
 
     // Blocking receive of one SOCKET-layer event. Returns false on stop/error.
     virtual bool recvSocket(SocketEventInfo& ev) = 0;

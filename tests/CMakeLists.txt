@@ -68,6 +68,17 @@ aps_add_test(test_doh_resolver integration)
 aps_add_test(test_kernel_discovery integration)
 
 # --- e2e (real WinDivert driver; needs admin) ---------------------------------
+# Opt-in diagnostic for an external-looking tuple redirected to a local peer.
+# Never part of the default ctest run: production communications may be active.
+add_executable(e2e_tcp_return_route EXCLUDE_FROM_ALL e2e/e2e_tcp_return_route.cpp)
+target_link_libraries(e2e_tcp_return_route PRIVATE appsw_core)
+aps_set_warnings(e2e_tcp_return_route)
+add_custom_command(TARGET e2e_tcp_return_route POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${APS_WINDIVERT_ROOT}/bin/x64/WinDivert.dll"
+    "${APS_WINDIVERT_ROOT}/bin/x64/WinDivert64.sys"
+    "$<TARGET_FILE_DIR:e2e_tcp_return_route>")
+
 add_executable(aps_test_client e2e/test_client.cpp)
 target_compile_definitions(aps_test_client PRIVATE APS_BUILD_TESTS=1)
 target_link_libraries(aps_test_client PRIVATE ws2_32)

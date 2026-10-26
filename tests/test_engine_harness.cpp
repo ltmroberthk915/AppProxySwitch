@@ -576,6 +576,198 @@ APS_TEST(engine, return_path_from_relay_is_untranslated) {
     h.stop();
 }
 
+APS_TEST(engine, relay_return_remote_control_and_data_are_inbound) {
+    Harness h;
+    h.start(h.makeConfig());
+    h.pushConnectEvent(kAppPort);
+    const PacketMeta appMeta{true, false, false, false, 11, 3};
+    h.device->pushTcp(buildTcpPacket(kAppIp, kAppPort, kDstIp, kDstPort, 100, 0, 0x02),
+                      appMeta);
+    EXPECT_TRUE(h.device->waitSent(1, 3000));
+    const uint16_t relayPort = h.engine->relay().listenPort();
+    // WinDivert observes local relay replies as outbound loopback packets.
+    // Once their source becomes the remote server, they must enter the app's
+    // original receiving interface, including SYN-ACK retransmissions.
+    for (uint32_t relayIp : {kAppIp, uint32_t{0x7F000001}}) {
+        for (uint8_t flags : {uint8_t{0x12}, uint8_t{0x12}, uint8_t{0x18},
+                              uint8_t{0x11}, uint8_t{0x14}}) {
+            h.device->clearSent();
+            const std::vector<uint8_t> payload = flags == 0x18
+                ? std::vector<uint8_t>{'o', 'k'} : std::vector<uint8_t>{};
+            h.device->pushTcp(buildTcpPacket(relayIp, relayPort, kAppIp, kAppPort,
+                                             500, 101, flags, payload),
+                              {true, true, false, false, 99, 7});
+            EXPECT_TRUE(h.device->waitSent(1, 3000));
+            const auto sent = h.device->sent();
+            EXPECT_EQ(sent.size(), 1u);
+            if (sent.empty()) continue;
+            const auto p = parseSent(sent[0]);
+            EXPECT_EQ(p.srcIp, kDstIp);
+            EXPECT_EQ(p.srcPort, kDstPort);
+            EXPECT_EQ(p.dstIp, kAppIp);
+            EXPECT_EQ(p.dstPort, kAppPort);
+            EXPECT_EQ(p.seq, 500u);
+            EXPECT_EQ(p.ack, 101u);
+            EXPECT_EQ(p.payloadLen, payload.size());
+            EXPECT_FALSE(sent[0].meta.outbound);
+            EXPECT_FALSE(sent[0].meta.loopback);
+            EXPECT_FALSE(sent[0].meta.impostor);
+            EXPECT_EQ(sent[0].meta.ifIdx, appMeta.ifIdx);
+            EXPECT_EQ(sent[0].meta.subIfIdx, appMeta.subIfIdx);
+        }
+    }
+    h.stop();
+}
+
+APS_TEST(engine, relay_return_network_change_keeps_each_original_interface) {
+    Harness h;
+    h.start(h.makeConfig());
+    struct Flow { uint32_t ip, ifIdx, subIfIdx, dst; };
+    constexpr Flow flows[] = {
+        {0xC0A80523, 11, 2, 0x08080808},
+        {0xC0A80105, 13, 4, 0x09090909},
+        {0xC6120001, 41, 6, 0x01010101}
+    };
+    for (const auto& f : flows) {
+        h.pushConnectEvent(kAppPort, 100, f.dst, kDstPort, 6, f.ip);
+        h.device->clearSent();
+        h.device->pushTcp(buildTcpPacket(f.ip, kAppPort, f.dst, kDstPort, 100, 0, 0x02),
+                          {true, false, false, false, f.ifIdx, f.subIfIdx});
+        EXPECT_TRUE(h.device->waitSent(1, 3000));
+    }
+    EXPECT_EQ(h.engine->nat().size(), 3u);
+    for (const auto& f : flows) {
+        h.device->clearSent();
+        h.device->pushTcp(buildTcpPacket(f.ip, h.engine->relay().listenPort(),
+                                         f.ip, kAppPort, 500, 101, 0x12),
+                          {true, true, false, false, 1, 0});
+        EXPECT_TRUE(h.device->waitSent(1, 3000));
+        const auto sent = h.device->sent();
+        if (sent.empty()) continue;
+        EXPECT_EQ(parseSent(sent[0]).srcIp, f.dst);
+        EXPECT_FALSE(sent[0].meta.outbound);
+        EXPECT_FALSE(sent[0].meta.loopback);
+        EXPECT_EQ(sent[0].meta.ifIdx, f.ifIdx);
+        EXPECT_EQ(sent[0].meta.subIfIdx, f.subIfIdx);
+    }
+    h.stop();
+}
+
+APS_TEST(engine, relay_return_original_local_flow_remains_outbound) {
+    Harness h;
+    Config cfg = h.makeConfig();
+    cfg.routing.bypassPrivate = false;
+    h.start(cfg);
+    h.pushConnectEvent(kAppPort, 100, kAppIp, kDstPort);
+    const PacketMeta appMeta{true, true, false, false, 11, 3};
+    h.device->pushTcp(buildTcpPacket(kAppIp, kAppPort, kAppIp, kDstPort, 100, 0, 0x02),
+                      appMeta);
+    EXPECT_TRUE(h.device->waitSent(1, 3000));
+    EXPECT_EQ(h.engine->nat().size(), 1u);
+    h.device->clearSent();
+    h.device->pushTcp(buildTcpPacket(kAppIp, h.engine->relay().listenPort(),
+                                     kAppIp, kAppPort, 500, 101, 0x12),
+                      {true, true, false, false, 1, 0});
+    EXPECT_TRUE(h.device->waitSent(1, 3000));
+    const auto sent = h.device->sent();
+    if (!sent.empty()) {
+        EXPECT_EQ(parseSent(sent[0]).srcIp, kAppIp);
+        EXPECT_EQ(parseSent(sent[0]).srcPort, kDstPort);
+        EXPECT_TRUE(sent[0].meta.outbound);
+        EXPECT_TRUE(sent[0].meta.loopback);
+        EXPECT_EQ(sent[0].meta.ifIdx, appMeta.ifIdx);
+        EXPECT_EQ(sent[0].meta.subIfIdx, appMeta.subIfIdx);
+    }
+    h.stop();
+}
+
+APS_TEST(engine, relay_return_fix_preserves_unrelated_outbound_packets) {
+    Harness h;
+    h.start(h.makeConfig());
+    h.pushConnectEvent(kAppPort, 200);
+    const PacketMeta original{true, false, false, false, 23, 5};
+    const auto packet = buildTcpPacket(kAppIp, kAppPort, kDstIp, kDstPort, 100, 0, 0x02);
+    h.device->pushTcp(packet, original);
+    EXPECT_TRUE(h.device->waitSent(1, 3000));
+    auto sent = h.device->sent();
+    if (!sent.empty()) {
+        EXPECT_TRUE(sent[0].data == packet);
+        EXPECT_TRUE(sent[0].meta.outbound);
+        EXPECT_FALSE(sent[0].meta.loopback);
+        EXPECT_EQ(sent[0].meta.ifIdx, original.ifIdx);
+        EXPECT_EQ(sent[0].meta.subIfIdx, original.subIfIdx);
+    }
+    h.device->clearSent();
+    // A relay-port packet with no matching NAT entry is not ours to reroute.
+    const auto unknown = buildTcpPacket(kAppIp, h.engine->relay().listenPort(),
+                                        kAppIp, kAppPort, 500, 101, 0x12);
+    h.device->pushTcp(unknown, {true, true, false, false, 29, 8});
+    EXPECT_TRUE(h.device->waitSent(1, 3000));
+    sent = h.device->sent();
+    if (!sent.empty()) {
+        EXPECT_TRUE(sent[0].data == unknown);
+        EXPECT_TRUE(sent[0].meta.outbound);
+        EXPECT_TRUE(sent[0].meta.loopback);
+        EXPECT_EQ(sent[0].meta.ifIdx, 29u);
+        EXPECT_EQ(sent[0].meta.subIfIdx, 8u);
+    }
+    h.stop();
+}
+
+APS_TEST(engine, relay_return_teardown_uses_each_flow_original_metadata) {
+    Harness h;
+    Config cfg = h.makeConfig();
+    cfg.routing.bypassPrivate = false;
+    h.start(cfg);
+    struct Flow { uint32_t ip, dst, ifIdx, subIfIdx; bool loopback; };
+    constexpr Flow flows[] = {
+        {0xC0A80105, 0x08080808, 11, 3, false},
+        {0xC6120001, 0x09090909, 41, 6, false},
+        {0x0A080002, 0x0A080002, 17, 2, true}
+    };
+    for (const auto& f : flows) {
+        h.pushConnectEvent(kAppPort, 100, f.dst, kDstPort, 6, f.ip);
+        h.device->clearSent();
+        h.device->pushTcp(buildTcpPacket(f.ip, kAppPort, f.dst, kDstPort, 100, 0, 0x02),
+                          {true, f.loopback, false, false, f.ifIdx, f.subIfIdx});
+        EXPECT_TRUE(h.device->waitSent(1, 3000));
+    }
+    EXPECT_EQ(h.engine->nat().size(), 3u);
+    // Timer/GUI teardown must not inherit the most recently received packet's
+    // interface or direction: its metadata belongs to an unrelated flow.
+    h.pushConnectEvent(kAppPort + 1, 200);
+    h.device->clearSent();
+    h.device->pushTcp(buildTcpPacket(kAppIp, kAppPort + 1, kDstIp, kDstPort,
+                                     100, 0, 0x02),
+                      {true, false, false, false, 77, 9});
+    EXPECT_TRUE(h.device->waitSent(1, 3000));
+    h.device->clearSent();
+    h.engine->flushConnections(std::nullopt);
+    const auto sent = h.device->sent();
+    EXPECT_EQ(sent.size(), 3u);
+    for (const auto& f : flows) {
+        auto hit = std::find_if(sent.begin(), sent.end(), [&](const auto& s) {
+            pkt::TcpPacket p;
+            return pkt::parseTcpPacket(s.data.data(), s.data.size(), p) &&
+                   p.dstIp == f.ip && p.dstPort == kAppPort;
+        });
+        EXPECT_TRUE(hit != sent.end());
+        if (hit == sent.end()) continue;
+        const auto p = parseSent(*hit);
+        EXPECT_TRUE(hit->synthetic);
+        EXPECT_TRUE(p.rst);
+        EXPECT_EQ(p.srcIp, f.dst);
+        EXPECT_EQ(p.srcPort, kDstPort);
+        EXPECT_EQ(hit->meta.outbound, f.loopback);
+        EXPECT_EQ(hit->meta.loopback, f.loopback);
+        EXPECT_FALSE(hit->meta.impostor);
+        EXPECT_EQ(hit->meta.ifIdx, f.ifIdx);
+        EXPECT_EQ(hit->meta.subIfIdx, f.subIfIdx);
+    }
+    EXPECT_EQ(h.engine->nat().size(), 0u);
+    h.stop();
+}
+
 APS_TEST(engine, non_rule_process_passes_through_untouched) {
     Harness h;
     h.start(h.makeConfig());

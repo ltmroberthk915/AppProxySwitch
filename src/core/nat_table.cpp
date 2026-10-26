@@ -5,7 +5,8 @@ namespace aps {
 std::shared_ptr<NatEntry> NatTable::create(uint32_t appIp, uint16_t appPort, uint32_t dstIp,
                                            uint16_t dstPort, const std::string& ruleId,
                                            const std::string& outletId, uint32_t pid,
-                                           int64_t nowMs, bool dnsBridge) {
+                                           int64_t nowMs, bool dnsBridge,
+                                           const PacketMeta& appPacketMeta) {
     auto entry = std::make_shared<NatEntry>();
     entry->appIp = appIp;
     entry->appPort = appPort;
@@ -15,6 +16,7 @@ std::shared_ptr<NatEntry> NatTable::create(uint32_t appIp, uint16_t appPort, uin
     entry->outletId = outletId;
     entry->pid = pid;
     entry->dnsBridge = dnsBridge;
+    entry->appPacketMeta = appPacketMeta;
     entry->tCreateMs.store(nowMs);
     entry->tLastActivityMs.store(nowMs);
     std::unique_lock<std::shared_mutex> lk(mu_);

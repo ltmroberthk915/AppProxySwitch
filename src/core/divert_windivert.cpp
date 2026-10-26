@@ -239,14 +239,29 @@ public:
     bool sendLastTcp(const uint8_t* buf, size_t len, bool forceLoopback) override {
         WINDIVERT_ADDRESS addr = lastTcpAddr_;
         if (forceLoopback) {
-            // Only flag the loopback path; keep the original interface index,
-            // which for self-addressed packets already is the loopback one.
+            // Descriptive only: WinDivert ignores Loopback on injection.
+            // Forward self-addressed packets retain native outbound routing;
+            // external replies use sendTcpPacket with Outbound=false.
             addr.Loopback = 1;
         }
         return send(tcpHandle_, buf, len, addr);
     }
     bool sendLastUdp(const uint8_t* buf, size_t len) override {
         return send(udpHandle_, buf, len, lastUdpAddr_);
+    }
+
+    bool sendTcpPacket(const uint8_t* buf, size_t len,
+                       const PacketMeta& meta) override {
+        WINDIVERT_ADDRESS addr{};
+        addr.Layer = WINDIVERT_LAYER_NETWORK;
+        addr.Event = WINDIVERT_EVENT_NETWORK_PACKET;
+        addr.Outbound = meta.outbound;
+        addr.Loopback = meta.loopback;
+        addr.IPv6 = meta.ipv6;
+        addr.IPChecksum = addr.TCPChecksum = 1;
+        addr.Network.IfIdx = meta.ifIdx;
+        addr.Network.SubIfIdx = meta.subIfIdx;
+        return send(tcpHandle_, buf, len, addr);
     }
     bool sendLastTcp6(const uint8_t* buf, size_t len) override {
         return send(tcp6Handle_, buf, len, lastTcp6Addr_);
@@ -269,18 +284,9 @@ public:
         return send(dnsHandle_, buf, len, addr);
     }
 
-    bool sendSyntheticTcp(const uint8_t* buf, size_t len, bool loopback) override {
-        WINDIVERT_ADDRESS addr = lastTcpAddr_;
-        addr.Layer = WINDIVERT_LAYER_NETWORK;
-        addr.Event = WINDIVERT_EVENT_NETWORK_PACKET;
-        addr.Outbound = 1;
-        addr.Loopback = loopback ? 1 : 0;
-        // Reuse the last observed interface index (correct for loopback
-        // delivery to local apps); zeroing it makes WinDivertSend fail with
-        // ERROR_NO_DATA on some systems.
-        addr.IPChecksum = 0;
-        addr.TCPChecksum = 0;
-        return send(tcpHandle_, buf, len, addr);
+    bool sendSyntheticTcp(const uint8_t* buf, size_t len,
+                          const PacketMeta& meta) override {
+        return sendTcpPacket(buf, len, meta);
     }
 
     bool recvSocket(SocketEventInfo& ev) override {

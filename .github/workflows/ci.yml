@@ -31,6 +31,16 @@ jobs:
       - name: WinDivert e2e tests (requires admin; GH runners are elevated)
         run: ctest --test-dir build/release -C Release -L windivert --output-on-failure
 
+      - name: External tuple return-path regression (real driver)
+        shell: pwsh
+        run: |
+          cmake --build build/release --config Release --target e2e_tcp_return_route
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/release/tests/Release/e2e_tcp_return_route.exe --check-filter-boundary
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build/release/tests/Release/e2e_tcp_return_route.exe --run-owned-tuple
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Package
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File package-release.ps1

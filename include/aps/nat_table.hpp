@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "aps/net.hpp"
+#include "aps/divert_device.hpp"
 #include "aps/relay_server.hpp"
 
 namespace aps {
@@ -34,6 +35,20 @@ struct NatEntry : public IRelaySessionSink {
     // not a normal SOCKS session. The original destination is retained for
     // exact fail-open fallback.
     bool dnsBridge = false;
+
+    // Frozen before publication, from the application's original SYN.
+    // Relay replies are local loopback packets even for external targets,
+    // so their own metadata cannot identify the application's return path.
+    PacketMeta appPacketMeta;
+
+    PacketMeta returnPacketMeta() const {
+        PacketMeta meta = appPacketMeta;
+        // Native loopback is outbound-only. External replies must be inbound;
+        // setting Loopback alone does not change WinDivert's injection path.
+        meta.outbound = appPacketMeta.loopback;
+        meta.impostor = false;
+        return meta;
+    }
 
     std::atomic<int32_t> state{static_cast<int32_t>(NatState::SynSent)};
     std::atomic<bool> rstSeen{false};
@@ -73,7 +88,8 @@ public:
     std::shared_ptr<NatEntry> create(uint32_t appIp, uint16_t appPort, uint32_t dstIp,
                                      uint16_t dstPort, const std::string& ruleId,
                                      const std::string& outletId, uint32_t pid,
-                                     int64_t nowMs, bool dnsBridge = false);
+                                     int64_t nowMs, bool dnsBridge = false,
+                                     const PacketMeta& appPacketMeta = {});
 
     std::shared_ptr<NatEntry> findByFwd(uint32_t appIp, uint16_t appPort, uint32_t dstIp,
                                         uint16_t dstPort);

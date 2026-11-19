@@ -1,7 +1,7 @@
 ﻿; AppProxySwitch installer (Inno Setup 6).
 ; UTF-8 with BOM: Chinese strings are kept as-is.
 #define MyAppName "AppProxySwitch"
-#define MyAppVersion "1.3.9"
+#define MyAppVersion "1.3.10"
 #define MyAppExeName "AppProxySwitch.exe"
 
 [Setup]
@@ -41,6 +41,8 @@ Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\WinDivert.dll"; DestDi
 ; Inno's normal version comparison skips the installed driver when the bundled
 ; version is unchanged, while still replacing it on a real driver upgrade.
 Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\WinDivert64.sys"; DestDir: "{app}"
+Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\config.example.json"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\README.en.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\scripts\*.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\dist\AppProxySwitch-{#MyAppVersion}.0-win-x64\*.txt"; DestDir: "{app}"; Flags: ignoreversion

@@ -1,29 +1,16 @@
-// Automatic proxy-kernel discovery: find every Clash-family proxy kernel
-// running on this machine (SakuraCat, Clash for Windows, Mihomo, ...) and
-// wire it up with zero user configuration.
-//
-// Method: enumerate IPv4 / dual-stack loopback-accessible TCP ports with their
-// owning PID (instant), resolve PID -> process image name (instant), then
-// filter to proxy-kernel candidates by name and probe ONLY those ports with
-// a SOCKS5 handshake (Socks5Client::probe) and a Clash controller
-// GET /version (ClashApiClient::probeAny). Controller pipes are read from
-// the process's actual launch/config; when inaccessible, cached pipes or
-// existing process-named pipes (including instance suffixes) of proven SOCKS processes are revalidated
-// against their current server PID and /version (never trusted by name).
-// A verified pipe core without SOCKS is a diagnostic row, never an egress.
-//
-// The name filter (built-in patterns + names learned from past scans via
-// the persistent cache) is what makes re-scans near-instant: a machine
-// typically has 1-3 candidate processes with a handful of ports, instead of
-// ~90 silent listeners that would each burn a probe timeout. The blind full
-// scan is only a fallback for never-seen kernels.
+// Discover loopback SOCKS5 outlets and their optional Clash controllers.
+// The listening process owns the endpoint. Launcher names are for display.
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace aps {
+
+enum class ProxyPortKind { Mixed, Socks };
 
 struct DiscoveredKernel {
     uint32_t pid = 0;
@@ -44,11 +31,21 @@ struct DiscoveredKernel {
     std::string id;           // stable id: "auto-<procName>", "#2"/"#3" for extra instances
     std::string apiPipe;      // local HTTP controller pipe; mutually exclusive with apiPort
     std::string discoveryError; // verified core with no usable SOCKS listener
+    std::string launcherName;  // same-directory parent, when observable
+    uint16_t conflictPort = 0;
+    uint32_t conflictOwner = 0;
+    ProxyPortKind conflictKind = ProxyPortKind::Mixed;
+    std::string repairMessage;
     bool hasApi() const { return apiPort != 0 || !apiPipe.empty(); }
 };
 
+// Recheck the conflicting owner and controller, change only the runtime
+// inbound, then verify SOCKS and ownership. Discovery by itself stays read-only.
+bool repairConflictingProxyPort(DiscoveredKernel& kernel, uint16_t preferredPort = 0);
+
 enum class DiscoveryMode {
-    Quick,  // name-filtered candidates only (built-in patterns + cache) — instant
+    Quick,  // changed listeners and live candidates; revalidate on manual tests
+    Changed, // periodic tick may reuse healthy results with unchanged ownership
     Full,   // probe every loopback listener (fallback; finds unknown kernels)
 };
 
@@ -58,12 +55,21 @@ enum class DiscoveryMode {
 // just a silent listener burning scan time). Probes run as flat tasks on a
 // small worker pool.
 //
-// Quick mode filters listeners by proxy-kernel process names first (built-in
-// patterns + every name the scanner has ever cached) and probes only those —
-// usually a few ports, ~instant. Full mode probes everything and should only
-// run on first start or periodically as a fallback.
+// One snapshot per engine, updated only after a completed scan. A stateless
+// call starts from an empty baseline and verifies current endpoints.
+struct DiscoverySnapshot {
+    std::map<uint32_t, std::string> names;
+    std::map<uint32_t, std::vector<uint16_t>> ports;
+    std::set<uint32_t> retry;
+    struct Observed {
+        DiscoveredKernel kernel;
+        uint64_t creationTime;
+    };
+    std::map<uint32_t, Observed> observed;
+};
 std::vector<DiscoveredKernel> discoverProxyKernels(
-    int timeoutMs = 500, DiscoveryMode mode = DiscoveryMode::Quick);
+    int timeoutMs = 500, DiscoveryMode mode = DiscoveryMode::Quick,
+    DiscoverySnapshot* previous = nullptr);
 
 // --- persistent cache ------------------------------------------------------
 // Remembers process names, stable outlet IDs and instance/controller hints.

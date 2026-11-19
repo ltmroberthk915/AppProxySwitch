@@ -96,7 +96,8 @@ uint16_t Engine::resolveDefaultSocksPort(const Config& cfg) {
     uint16_t only = 0;
     int live = 0;
     for (const auto& kv : discovered_) {
-        if (!kv.second.alive || kv.second.kernel.socksPort == 0) continue;
+        // A generic SOCKS listener becomes an outlet by explicit selection.
+        if (!kv.second.alive || !kv.second.kernel.socksPort || !kv.second.kernel.hasApi()) continue;
         ++live;
         only = kv.second.kernel.socksPort;
     }
@@ -271,7 +272,8 @@ void Engine::rebuildHealthMonitors(const Config& cfg) {
     {
         std::lock_guard<std::mutex> lk(discMu_);
         for (const auto& kv : discovered_) {
-            if (kv.second.alive && kv.second.kernel.socksPort != 0) {
+            if (kv.second.alive && kv.second.kernel.socksPort != 0 &&
+                (kv.second.kernel.hasApi() || cfg.routing.autoOutletId == kv.first)) {
                 aliveDiscovered.push_back(kv.second.kernel);
             }
         }
@@ -586,10 +588,15 @@ void Engine::stop() {
 }
 
 void Engine::reloadConfig(const Config& cfg) {
+    const auto previous = runtime();
     auto rt = std::make_shared<Runtime>();
     rt->cfg = cfg;
     rt->matcher = RuleMatcher::compile(cfg, selfPath_);
     runtime_.store(rt);
+    if (cfg.nodeMonitor.repairPortConflicts && previous && !previous->cfg.nodeMonitor.repairPortConflicts) {
+        repairScanRequested_.store(true);
+        if (nodeWakeEvent_) SetEvent(nodeWakeEvent_);
+    }
 
     rebuildOutlets(cfg);
     RelayParams rp = outletParams(kDefaultOutletId);
@@ -1146,12 +1153,13 @@ void Engine::nodeMonitorPump() {
                 didWork = true;
             }
         }
-        if (periodic && kernelDiscoveryEnabled_.load()) {
+        const bool repairRequested = repairScanRequested_.exchange(false);
+        if ((periodic || repairRequested) && kernelDiscoveryEnabled_.load()) {
             // Re-scan for kernels on the monitor tick: restarted kernels get
             // re-attached with their new random ports automatically. A blind
             // full scan runs every 10th tick as a fallback for kernels whose
             // process name no filter has ever seen.
-            DiscoveryMode mode = DiscoveryMode::Quick;
+            DiscoveryMode mode = repairRequested ? DiscoveryMode::Quick : DiscoveryMode::Changed;
             if (--fullScanCountdown_ <= 0) {
                 mode = DiscoveryMode::Full;
                 fullScanCountdown_ = 10;
@@ -1334,6 +1342,7 @@ void Engine::runNodeRoundFor(const std::string& outletId, bool manual, const std
     // Resolve the outlet's controller config (manual or discovered).
     ClashApiConfig api;
     bool found = false;
+    uint32_t socksOnlyPid = 0;
     if (outletId == kDefaultOutletId && !cfg.proxy.clashApi.host.empty()) {
         api = cfg.proxy.clashApi;
         found = true;
@@ -1358,6 +1367,8 @@ void Engine::runNodeRoundFor(const std::string& outletId, bool manual, const std
             api.pipePid = it->second.kernel.pid;
             api.secretPlain = it->second.kernel.apiSecret;
             found = true;
+        } else if (it != discovered_.end() && it->second.alive) {
+            socksOnlyPid = it->second.kernel.pid;
         }
     }
     if (!found) {
@@ -1373,6 +1384,10 @@ void Engine::runNodeRoundFor(const std::string& outletId, bool manual, const std
                 std::string error;
                 st.alive = Socks5Client::probe(params->second.proxy, cfg.proxy.healthTimeoutMs, nullptr, &error,
                                                params->second.username, params->second.password);
+                if (manual && st.alive && socksOnlyPid && !requestId.empty()) {
+                    const auto ports = listeningPortsOf(socksOnlyPid);
+                    st.socksOnlyReady = std::find(ports.begin(), ports.end(), st.checkedProxy.port) != ports.end();
+                }
             }
         }
         st.apiError = st.alive ? "代理端口握手正常；节点控制器未识别，暂无法自动选线"
@@ -1441,14 +1456,40 @@ void Engine::adoptDiscoveries(DiscoveryMode mode) {
     // Adoption rebuilds outlets + health monitors; racing a shutdown's
     // monitor teardown would leave orphan monitor threads behind (and the
     // stop path must never wait on adoption's network probes).
+    std::lock_guard<std::mutex> scanLock(scanMu_);
     if (stopping_.load()) return;
     std::vector<DiscoveredKernel> found;
     found = discoveryScan_ ? discoveryScan_(mode)
-                           : discoverProxyKernels(500, mode);
+                           : discoverProxyKernels(500, mode, &scanSnapshot_);
     const auto currentRuntime = runtime();
+    std::erase_if(portRepairs_, [&](const auto& entry) {
+        return std::none_of(found.begin(), found.end(), [&](const auto& k) { return k.pid == entry.first; });
+    });
+    for (auto& k : found) {
+        const auto settings = runtime();
+        if (k.conflictPort && !stopping_.load() && settings && settings->cfg.nodeMonitor.repairPortConflicts) {
+            auto& repair = portRepairs_[k.pid];
+            if (repair.oldPort != k.conflictPort || repair.kind != k.conflictKind) repair = {};
+            if (GetTickCount64() >= repair.nextAttempt) {
+                repair.oldPort = k.conflictPort;
+                repair.kind = k.conflictKind;
+                bool ok = repairConflictingProxyPort(k, repair.replacement);
+                if (ok) repair.replacement = k.socksPort;
+                repair.message = k.repairMessage;
+                repair.nextAttempt = GetTickCount64() + 30000;
+                log::ifmt("port repair [{} pid {}]: {}", k.procName, k.pid, k.repairMessage);
+            } else {
+                k.repairMessage = repair.replacement ? "等待重试冲突端口" : repair.message;
+            }
+        } else if (const auto it = portRepairs_.find(k.pid); it != portRepairs_.end() &&
+                   k.socksPort && k.socksPort == it->second.replacement) {
+            k.repairMessage = it->second.message;
+        }
+    }
     const std::string selectedId = currentRuntime ? currentRuntime->cfg.routing.autoOutletId : std::string();
 
     bool changed = false;
+    std::set<std::string> recovered;
     {
         std::lock_guard<std::mutex> lk(discMu_);
         auto eqName = [](const std::string& a, const std::string& b) {
@@ -1486,7 +1527,10 @@ void Engine::adoptDiscoveries(DiscoveryMode mode) {
             std::string targetId;
             for (const auto& kv : discovered_) {
                 if (!eqName(kv.second.kernel.procName, k.procName)) continue;
-                if (kv.second.kernel.pid == k.pid) { targetId = kv.first; break; }
+                if (kv.second.kernel.pid == k.pid && dirsAgree(kv.second.kernel.configDir, k.configDir)) {
+                    targetId = kv.first;
+                    break;
+                }
             }
             // Keep the user's activated identity ahead of historical cache
             // rows when a core moves between service and sidecar mode.
@@ -1620,7 +1664,7 @@ void Engine::adoptDiscoveries(DiscoveryMode mode) {
             seen.insert(targetId);
             auto it = discovered_.find(targetId);
             if (it == discovered_.end()) {
-                discovered_[targetId] = KernelEntry{k, k.socksPort != 0, true};
+                discovered_[targetId] = KernelEntry{k, k.socksPort != 0, true, true};
                 changed = true;
                 log::ifmt("kernel discovered: {} [pid {} dir '{}'] (socks {} api {})",
                           k.procName, k.pid, k.configDir, k.socksPort, k.apiPort);
@@ -1630,19 +1674,13 @@ void Engine::adoptDiscoveries(DiscoveryMode mode) {
             } else {
                 auto& e = it->second;
                 auto& old = e.kernel;
-                // A transient scan miss on the controller must not wipe a
-                // known API port: keep it when the same PID still serves
-                // the same SOCKS port and only the API probe came up empty.
-                if (old.pid == k.pid && old.socksPort == k.socksPort &&
-                    !k.hasApi() && old.hasApi()) {
-                    k.apiPort = old.apiPort;
-                    k.apiPipe = old.apiPipe;
-                    k.apiSecret = old.apiSecret;
-                }
-                if (e.alive != (k.socksPort != 0) || old.socksPort != k.socksPort ||
+                if (k.socksPort && (!e.alive || old.socksPort != k.socksPort || old.hasApi() != k.hasApi()))
+                    recovered.insert(targetId);
+                if (!e.running || e.alive != (k.socksPort != 0) || old.socksPort != k.socksPort ||
                     old.apiPort != k.apiPort || old.apiSecret != k.apiSecret ||
                     old.apiPipe != k.apiPipe || old.pid != k.pid ||
-                    old.discoveryError != k.discoveryError) {
+                    old.apiNeedSecret != k.apiNeedSecret || old.launcherName != k.launcherName ||
+                    old.discoveryError != k.discoveryError || old.repairMessage != k.repairMessage) {
                     if (old.socksPort != k.socksPort || old.apiPort != k.apiPort) {
                         log::ifmt("kernel {} ports updated: socks {}->{} api {}->{}",
                                   k.procName, old.socksPort, k.socksPort,
@@ -1658,10 +1696,15 @@ void Engine::adoptDiscoveries(DiscoveryMode mode) {
                     changed = true;
                 }
                 e.verified = true;
+                e.running = true;
             }
         }
         for (auto& kv : discovered_) {
             if (seen.count(kv.first) != 0) continue;
+            if (kv.second.running) {
+                kv.second.running = false;
+                changed = true;
+            }
             if (!kv.second.kernel.discoveryError.empty()) {
                 kv.second.kernel.discoveryError.clear();
                 changed = true;
@@ -1714,9 +1757,14 @@ void Engine::adoptDiscoveries(DiscoveryMode mode) {
                                   : kv.second.kernel.hasApi() ? "检测中…"
                                   : "内核运行中，节点控制器尚未识别（不代表代理端口不可用）";
                 nodeStatus_[kv.first] = std::move(st);
+            } else if (recovered.count(kv.first)) {
+                it->second = NodeStatus{};
+                it->second.outletId = kv.first;
+                it->second.apiError = kv.second.kernel.hasApi() ? "代理端口已就绪，等待节点检测" : "通用 SOCKS5 代理";
             } else if (!kv.second.alive) {
                 it->second.apiAvailable = false;
                 it->second.alive = false;
+                it->second.socksOnlyReady = false;
                 it->second.latencyMs = -1;
                 it->second.node.clear();
                 it->second.apiError = kv.second.kernel.discoveryError.empty()
@@ -1741,15 +1789,20 @@ json::Value Engine::kernelsJson() const {
         json::Value o = json::Value::makeObject();
         o.set("id", kv.second.kernel.id);
         o.set("name", kv.second.kernel.procName);
+        o.set("launcher", kv.second.kernel.launcherName);
+        const bool current = kv.second.running;
+        // Existing status consumers use pid as the last observed instance.
+        // running distinguishes that history from a current process.
         o.set("pid", kv.second.kernel.pid);
-        const bool current = kv.second.alive || !kv.second.kernel.discoveryError.empty();
+        o.set("running", current);
         o.set("socks_port", static_cast<uint32_t>(current ? kv.second.kernel.socksPort : 0));
         o.set("api_port", static_cast<uint32_t>(current ? kv.second.kernel.apiPort : 0));
-        o.set("has_api", kv.second.kernel.hasApi());
-        o.set("controller", !kv.second.kernel.apiPipe.empty() ? "pipe" :
-                            kv.second.kernel.apiPort ? "tcp" : "none");
-        o.set("api_pipe", kv.second.kernel.apiPipe);
+        o.set("has_api", current && kv.second.kernel.hasApi());
+        o.set("controller", current && !kv.second.kernel.apiPipe.empty() ? "pipe" :
+                            current && kv.second.kernel.apiPort ? "tcp" : "none");
+        o.set("api_pipe", current ? kv.second.kernel.apiPipe : "");
         o.set("discovery_error", kv.second.kernel.discoveryError);
+        o.set("port_repair", current ? kv.second.kernel.repairMessage : "");
         o.set("alive", kv.second.alive);
         // "seen" = a completed scan has observed this entry (found OR
         // confirmed missing). Unverified rows are the brief post-start
@@ -2925,6 +2978,7 @@ json::Value Engine::nodeStatusJson() const {
         j.set("last_switch_detail", kv.second.lastSwitchDetail);
         j.set("switching", kv.second.switching);
         j.set("selection_ok", kv.second.selectionSatisfied);
+        j.set("socks_only_ready", kv.second.socksOnlyReady && rt && rt->params.count(kv.first));
         j.set("test_request_id", kv.second.testRequestId);
         j.set("region", kv.second.region);
         json::Value classes = json::Value::makeArray();

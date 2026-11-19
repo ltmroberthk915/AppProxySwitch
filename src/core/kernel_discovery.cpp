@@ -99,7 +99,7 @@ int clampProbeTimeout(int timeoutMs) {
 // PID -> process image name for every running process. Toolhelp snapshot
 // needs no process handle rights, unlike OpenProcess-based lookups (which
 // fail for elevated or protected processes).
-std::map<uint32_t, std::string> processNameMap() {
+std::map<uint32_t, std::string> processNameMap(std::map<uint32_t, uint32_t>* parents = nullptr) {
     std::map<uint32_t, std::string> m;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return m;
@@ -111,10 +111,20 @@ std::map<uint32_t, std::string> processNameMap() {
             WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, utf8, sizeof(utf8),
                                 nullptr, nullptr);
             m[pe.th32ProcessID] = utf8;
+            if (parents) parents->emplace(pe.th32ProcessID, pe.th32ParentProcessID);
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
     return m;
+}
+
+uint64_t processCreationTime(uint32_t pid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return 0;
+    FILETIME start{}, exit{}, kernel{}, user{};
+    const bool ok = GetProcessTimes(process, &start, &exit, &kernel, &user) != FALSE;
+    CloseHandle(process);
+    return ok ? (static_cast<uint64_t>(start.dwHighDateTime) << 32) | start.dwLowDateTime : 0;
 }
 
 // All LISTENING 127.0.0.1 / 0.0.0.0 ports with owning PID, excluding system
@@ -173,8 +183,9 @@ std::vector<std::pair<uint32_t, uint16_t>> enumerateListeners() {
 }
 
 bool probeApiPort(uint16_t port, int timeout, bool* needSecret) {
-    auto p = ClashApiClient("127.0.0.1", port, "").probeAny(timeout);
-    if (!p.reachable) return false;
+    ClashApiClient api("127.0.0.1", port, "");
+    auto p = api.probeAny(timeout);
+    if (!p.reachable || (!p.needSecret && !api.hasProxyInventory(timeout))) return false;
     if (needSecret) *needSecret = p.needSecret;
     return true;
 }
@@ -211,8 +222,9 @@ void finishKernel(DiscoveredKernel& k) {
     // unreadable. Do not send CFW credentials to every Clash-family app.
     if (secret.empty() && lower(k.procName) == "clash-win64.exe") secret = readCfwSecret();
     if (!secret.empty()) {
-        auto p = ClashApiClient("127.0.0.1", k.apiPort, secret, k.apiPipe, k.pid).probeAny(250);
-        if (p.reachable && !p.needSecret) {
+        ClashApiClient api("127.0.0.1", k.apiPort, secret, k.apiPipe, k.pid);
+        auto p = api.probeAny(250);
+        if (p.reachable && !p.needSecret && api.hasProxyInventory(250)) {
             k.apiSecret = std::move(secret);
             k.apiNeedSecret = false;
         }
@@ -503,17 +515,17 @@ void mergeDiscoveredIntoCache(const std::vector<DiscoveredKernel>& fresh) {
 // ---------------------------------------------------------------------------
 
 std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
-                                                   DiscoveryMode mode) {
+                                                   DiscoveryMode mode,
+                                                   DiscoverySnapshot* previous) {
     const int t = clampProbeTimeout(timeoutMs);
     auto listeners = enumerateListeners();
-    auto names = processNameMap();
+    DiscoverySnapshot nextScan;
+    std::map<uint32_t, uint32_t> parents;
+    auto& names = nextScan.names;
+    names = processNameMap(&parents);
+    for (const auto& [pid, port] : listeners) nextScan.ports[pid].push_back(port);
 
-    // Quick mode: probe only processes whose name matches a built-in kernel
-    // pattern or a name the scanner has cached before. Enumerating the table
-    // and resolving names takes milliseconds; the probes (a handful of ports)
-    // finish near-instantly, unlike a blind scan of every loopback listener.
-    // In Full mode the same list marks a name as KNOWN: unknown-name
-    // processes must then prove themselves with BOTH ports (see assembly).
+    // Name hints can trigger a retry. Only protocol evidence creates a row.
     std::vector<std::string> allowed;
     for (const char* h : kKernelNameHints) allowed.emplace_back(h);
     const auto cached = loadKernelCache();
@@ -533,15 +545,39 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
         return false;
     };
 
-    std::map<uint32_t, std::vector<uint16_t>> byPid;
-    std::map<uint32_t, bool> knownPid;
-    for (const auto& [pid, port] : listeners) {
-        auto it = names.find(pid);
-        if (it == names.end()) continue;
-        if (isExcluded(it->second)) continue;
-        if (!isAllowed(it->second) && mode == DiscoveryMode::Quick) continue;
-        if (mode == DiscoveryMode::Full) knownPid[pid] = isAllowed(it->second);
-        byPid[pid].push_back(port);
+    std::set<uint32_t> candidatePids;
+    std::vector<DiscoveredKernel> kernels;
+    for (const auto& [pid, name] : names) {
+        if (isExcluded(name)) continue;
+        // Isolated harnesses use real listeners in this process and its
+        // fixture children. Never deliver the user's live proxies to a test engine.
+        if (!cacheDirectoryOverride().empty() && pid != GetCurrentProcessId() &&
+            parents.at(pid) != GetCurrentProcessId()) continue;
+        if (!previous || mode == DiscoveryMode::Full) {
+            candidatePids.insert(pid);
+            continue;
+        }
+        const auto oldName = previous->names.find(pid);
+        const bool sameProcessName = oldName != previous->names.end() && oldName->second == name;
+        const auto oldPorts = previous->ports.find(pid);
+        const auto ports = nextScan.ports.find(pid);
+        const bool samePorts = ports == nextScan.ports.end() ? oldPorts == previous->ports.end()
+            : oldPorts != previous->ports.end() && ports->second == oldPorts->second;
+        const auto observed = previous->observed.find(pid);
+        if (sameProcessName && samePorts && observed != previous->observed.end() &&
+            mode == DiscoveryMode::Changed && observed->second.kernel.socksPort &&
+            observed->second.kernel.apiPipe.empty() && observed->second.creationTime &&
+            processCreationTime(pid) == observed->second.creationTime) {
+            kernels.push_back(observed->second.kernel);
+            continue;
+        }
+        if (!sameProcessName || !samePorts || observed != previous->observed.end() ||
+            previous->retry.count(pid) || isAllowed(name)) {
+            candidatePids.insert(pid);
+            // A new listener may appear before its protocol handler is ready.
+            if ((!sameProcessName || !samePorts) && ports != nextScan.ports.end())
+                nextScan.retry.insert(pid);
+        }
     }
 
     // Flat task pool: one task per (pid, port, probe-kind). Silent listeners
@@ -553,7 +589,8 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
         bool isApi;
     };
     std::vector<Task> tasks;
-    for (const auto& kv : byPid) {
+    for (const auto& kv : nextScan.ports) {
+        if (!candidatePids.count(kv.first)) continue;
         for (uint16_t p : kv.second) {
             tasks.push_back({kv.first, p, true});
             tasks.push_back({kv.first, p, false});
@@ -583,7 +620,7 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
                     if (probeApiPort(task.port, t, &needSecret)) {
                         std::lock_guard<std::mutex> lk(slotsMu);
                         Slot& s = slots[task.pid];
-                        if (s.apiPort == 0) {
+                        if (s.apiPort == 0 || (s.apiNeedSecret && !needSecret)) {
                             s.apiPort = task.port;
                             s.apiNeedSecret = needSecret;
                         }
@@ -607,7 +644,7 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
     std::map<uint32_t, std::string> cmdlines;
     std::map<uint32_t, KernelLaunchConfig> launches;
     for (const auto& [pid, name] : names) {
-        if (isExcluded(name) || (mode == DiscoveryMode::Quick && !isAllowed(name))) continue;
+        if (!candidatePids.count(pid)) continue;
         auto cmd = processCommandLine(pid);
         auto flags = parseKernelLaunchConfig(cmd);
         // Ordinary app -f flags are not permission to crawl unrelated files.
@@ -620,7 +657,10 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
                                 launch.pipe, pid).probeAny(t);
         // For a pipe, require a valid /version response AND matching server
         // PID. A random app's 401 cannot create an API-only kernel row.
-        if (!p.reachable || p.needSecret) continue;
+        if (!p.reachable || p.needSecret) {
+            nextScan.retry.insert(pid);
+            continue;
+        }
         auto& slot = slots[pid];
         slot.apiPort = 0;
         slot.apiNeedSecret = false;
@@ -683,30 +723,31 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
     }
 
     // Assemble kernels from probe results.
-    std::vector<DiscoveredKernel> kernels;
+    // A listener can be replaced while the workers are probing. Discard
+    // evidence for ports which now belong to a different process.
+    const auto currentListeners = enumerateListeners();
+    auto stillOwned = [&](uint32_t pid, uint16_t port) {
+        return std::binary_search(currentListeners.begin(), currentListeners.end(), std::pair{pid, port});
+    };
+    std::erase_if(kernels, [&](const auto& k) {
+        return !stillOwned(k.pid, k.socksPort) || (k.apiPort && !stillOwned(k.pid, k.apiPort));
+    });
     for (const auto& kv : slots) {
-        const Slot& s = kv.second;
-        // A proxy kernel MUST have a SOCKS port. API-only responders are
-        // ordinary local HTTP services (dev servers, app backends — measured
-        // in the wild: node.exe, DSH Desktop.exe) — never adopt them.
-        if (s.socksPort == 0 && s.apiPipe.empty()) continue;
+        Slot s = kv.second;
+        if (s.socksPort && !stillOwned(kv.first, s.socksPort)) s.socksPort = 0;
+        if (s.apiPort && !stillOwned(kv.first, s.apiPort)) s.apiPort = 0;
+        if (!s.socksPort && !s.apiPort && s.apiPipe.empty()) continue;
         DiscoveredKernel k;
         k.pid = kv.first;
         auto nameIt = names.find(k.pid);
         if (nameIt == names.end()) continue;  // process exited mid-scan
         k.procName = nameIt->second;
-        // Unknown-name processes (Full blind scan) must prove themselves
-        // with BOTH ports; a lone SOCKS responder is more likely a generic
-        // proxy tool than an airport kernel, and junk adoption pollutes the
-        // persistent cache.
-        if (mode == DiscoveryMode::Full && !knownPid[k.pid] &&
-            s.apiPort == 0 && s.apiPipe.empty()) {
-            continue;
-        }
         k.socksPort = s.socksPort;
         k.apiPort = s.apiPort;
         k.apiNeedSecret = s.apiNeedSecret;
         k.apiPipe = s.apiPipe;
+        if (!k.socksPort && k.apiPipe.empty() && k.apiNeedSecret &&
+            k.apiPort != launches[k.pid].controllerPort) continue;
         if (!k.apiPipe.empty()) k.apiSecret = launches[k.pid].secret;
         // Identity fields: the command line carries the config dir (-d) and
         // the controller port (-ext-ctl) — the disambiguator between
@@ -723,23 +764,73 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
             }
         }
         finishKernel(k);
+        if (k.apiPort && k.apiNeedSecret && k.apiPort != launches[k.pid].controllerPort) {
+            k.apiPort = 0; // an unrelated HTTP authentication challenge
+            k.apiNeedSecret = false;
+        }
         if (k.socksPort == 0) {
             const auto& launch = launches[k.pid];
-            auto wanted = launch.mixedPort ? launch.mixedPort : launch.socksPort;
+            auto mixed = launch.mixedPort, socks = launch.socksPort;
+            if (k.apiPipe.empty()) {
+                if (!k.apiPort || k.apiNeedSecret) continue;
+                const auto ports = ClashApiClient("127.0.0.1", k.apiPort, k.apiSecret).inboundPorts(t);
+                if (ports.mixed.value_or(0)) mixed = *ports.mixed;
+                if (ports.socks.value_or(0)) socks = *ports.socks;
+            }
+            const auto wanted = mixed ? mixed : socks;
             k.discoveryError = "已发现内核，但 SOCKS/mixed 端口未监听";
-            if (wanted) {
-                k.discoveryError = "代理端口 " + std::to_string(wanted) + " 未就绪";
-                for (const auto& [owner, port] : listeners) {
-                    if (port != wanted || owner == k.pid) continue;
-                    k.discoveryError = "代理端口 " + std::to_string(wanted) +
-                        " 被其他进程占用（PID " + std::to_string(owner) + "）";
+            if (wanted) k.discoveryError = "代理端口 " + std::to_string(wanted) + " 未就绪";
+            for (const auto kind : {ProxyPortKind::Mixed, ProxyPortKind::Socks}) {
+                const auto desired = kind == ProxyPortKind::Mixed ? mixed : socks;
+                for (const auto& [owner, port] : currentListeners) {
+                    if (port != desired || owner == k.pid) continue;
+                    k.conflictPort = port;
+                    k.conflictOwner = owner;
+                    k.conflictKind = kind;
+                    k.discoveryError = "代理端口 " + std::to_string(port) +
+                        " 被其他进程占用（" + (names.count(owner) ? names.at(owner) + "，" : "") +
+                        "PID " + std::to_string(owner) + "）";
                     break;
                 }
+                if (k.conflictPort) break;
             }
+        }
+        const auto parent = parents.at(k.pid);
+        if (names.count(parent) && names.at(parent) != k.procName) {
+            const auto exe = processImagePath(k.pid), launcher = processImagePath(parent);
+            const auto dir = exe.find_last_of("\\/");
+            const auto parentStarted = processCreationTime(parent);
+            if (dir != std::string::npos && launcher.find_last_of("\\/") == dir &&
+                lower(exe.substr(0, dir)) == lower(launcher.substr(0, dir)) &&
+                parentStarted && parentStarted <= processCreationTime(k.pid))
+                k.launcherName = names.at(parent);
         }
         kernels.push_back(std::move(k));
     }
 
+    if (previous) {
+        for (const auto& k : kernels) {
+            nextScan.observed.emplace(k.pid, DiscoverySnapshot::Observed{k, processCreationTime(k.pid)});
+            nextScan.retry.erase(k.pid);
+        }
+        // A previously verified process can remain alive while all its
+        // endpoints restart. Retain identity only, never its old addresses.
+        for (const auto& [pid, old] : previous->observed) {
+            if (nextScan.observed.count(pid) || !names.count(pid) || names.at(pid) != old.kernel.procName ||
+                !old.creationTime || old.creationTime != processCreationTime(pid)) continue;
+            auto k = old.kernel;
+            k.socksPort = k.apiPort = 0;
+            k.apiPipe.clear();
+            k.apiSecret.clear();
+            k.apiNeedSecret = false;
+            k.conflictPort = 0;
+            k.conflictOwner = 0;
+            k.discoveryError = "进程仍在运行，等待 SOCKS5 或混合端口就绪";
+            nextScan.observed.emplace(pid, DiscoverySnapshot::Observed{k, old.creationTime});
+            kernels.push_back(std::move(k));
+        }
+        *previous = std::move(nextScan);
+    }
     // Deterministic order for callers and tests.
     std::sort(kernels.begin(), kernels.end(),
               [](const DiscoveredKernel& a, const DiscoveredKernel& b) {
@@ -747,6 +838,87 @@ std::vector<DiscoveredKernel> discoverProxyKernels(int timeoutMs,
               });
 
     return kernels;
+}
+
+namespace {
+// Let Winsock avoid occupied and excluded ports. Check UDP as well since a
+// mixed/SOCKS listener can bind both. The controller must bind for itself.
+uint16_t availableProxyPort(uint16_t preferred) {
+    SOCKET tcp = net::makeTcpSocket();
+    SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    BOOL exclusive = TRUE;
+    auto address = net::toSockaddr({0, preferred});
+    int length = sizeof(address);
+    const bool available = tcp != INVALID_SOCKET && udp != INVALID_SOCKET &&
+        setsockopt(tcp, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == 0 &&
+        setsockopt(udp, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == 0 &&
+        bind(tcp, reinterpret_cast<sockaddr*>(&address), length) == 0 &&
+        getsockname(tcp, reinterpret_cast<sockaddr*>(&address), &length) == 0 &&
+        bind(udp, reinterpret_cast<sockaddr*>(&address), length) == 0;
+    net::closeSocket(udp);
+    net::closeSocket(tcp);
+    return available ? ntohs(address.sin_port) : 0;
+}
+}
+
+bool repairConflictingProxyPort(DiscoveredKernel& k, uint16_t preferredPort) {
+    if (k.socksPort || !k.pid || !k.conflictPort || !k.conflictOwner ||
+        k.pid == k.conflictOwner || !k.hasApi() || k.apiNeedSecret) return false;
+    const auto old = k.conflictPort;
+    ClashApiClient api("127.0.0.1", k.apiPort, k.apiSecret, k.apiPipe, k.pid);
+    const auto ports = api.inboundPorts(750, k.pid);
+    const bool mixed = k.conflictKind == ProxyPortKind::Mixed;
+    const auto active = mixed ? ports.mixed : ports.socks;
+    if (!active || (*active != old && *active != 0)) {
+        k.repairMessage = "控制器未确认冲突配置，等待重新检测";
+        return false;
+    }
+    if (*active == 0) {
+        // Mihomo reports zero after bind fails. Check the running process's
+        // own launch file again before treating a disabled port as a conflict.
+        const auto launch = readKernelLaunchConfig(processCommandLine(k.pid));
+        if ((mixed ? launch.mixedPort : launch.socksPort) != old) {
+            k.repairMessage = "启动配置已变化，等待重新检测";
+            return false;
+        }
+    }
+    const auto owned = listeningPortsOf(k.pid);
+    for (const auto port : {ports.mixed.value_or(0), ports.socks.value_or(0)}) {
+        if (port && std::find(owned.begin(), owned.end(), port) != owned.end()) {
+            k.repairMessage = "内核已监听代理端口，等待重新检测";
+            return false;
+        }
+    }
+    uint16_t replacement = preferredPort ? availableProxyPort(preferredPort) : 0;
+    for (int i = 0; !replacement && i < 3; ++i) replacement = availableProxyPort(0);
+    if (!replacement) {
+        k.repairMessage = "未找到空闲代理端口";
+        return false;
+    }
+    auto owns = [](uint32_t pid, uint16_t port) {
+        const auto current = listeningPortsOf(pid);
+        return std::find(current.begin(), current.end(), port) != current.end();
+    };
+    if (!owns(k.conflictOwner, old) || owns(k.pid, old)) {
+        k.repairMessage = "端口占用已变化，等待重新检测";
+        return false;
+    }
+    const bool accepted = api.changeInboundPort(k.conflictKind, replacement, k.pid);
+    // A controller can acknowledge before binding, or bind even when its
+    // reply times out. Only adopt a working listener owned by the target.
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (owns(k.pid, replacement) && probeSocksPort(replacement, 200) && owns(k.pid, replacement)) {
+            k.socksPort = replacement;
+            k.conflictPort = 0;
+            k.conflictOwner = 0;
+            k.discoveryError.clear();
+            k.repairMessage = "已自动更换运行端口：" + std::to_string(old) + " → " + std::to_string(replacement);
+            return true;
+        }
+        if (attempt < 9) Sleep(50);
+    }
+    k.repairMessage = accepted ? "控制器已响应，新端口未通过 SOCKS5 验证" : "控制器未确认更改端口";
+    return false;
 }
 
 // ---------------------------------------------------------------------------

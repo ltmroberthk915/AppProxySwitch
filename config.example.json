@@ -51,6 +51,7 @@
     "tls_domain_allowlist": []
   },
   "node_monitor": {
+    "repair_port_conflicts": true,
     "enabled": true,
     "interval_s": 60,
     "fail_threshold": 2,

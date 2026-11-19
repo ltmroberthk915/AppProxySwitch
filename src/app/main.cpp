@@ -139,6 +139,7 @@ int main() {
             for (const auto& k : kernels) {
                 auto row = aps::json::Value::makeObject();
                 row.set("name", k.procName);
+                row.set("launcher", k.launcherName);
                 row.set("pid", k.pid);
                 row.set("socks_port", static_cast<uint32_t>(k.socksPort));
                 row.set("api_port", static_cast<uint32_t>(k.apiPort));

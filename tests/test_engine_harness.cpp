@@ -13,6 +13,7 @@
 
 #include "aps/engine.hpp"
 #include "aps/clash_api.hpp"
+#include "aps/socks5_client.hpp"
 #include "aps/pump_watchdog.hpp"
 #include "aps/log.hpp"
 #include "aps/string_util.hpp"
@@ -2534,6 +2535,7 @@ APS_TEST(engine, pipe_core_port_conflict_keeps_row_and_cannot_be_activated) {
     (*scripted)[0].discoveryError.clear();
     h.engine->adoptDiscoveries();
     EXPECT_TRUE(h.engine->outletEnabled(k.id));
+    EXPECT_TRUE(h.engine->statusJson().find(k.discoveryError) == std::string::npos);
     EXPECT_TRUE(h.engine->statusJson().find("#2") == std::string::npos);
     scripted->clear();
     h.engine->adoptDiscoveries();
@@ -4452,14 +4454,14 @@ APS_TEST(engine, discovery_adopts_kernels_and_marks_them_offline) {
     auto rp = h.engine->outletParams(autoId);
     EXPECT_TRUE(rp.proxy.port == socks2.port() || rp.proxy.port == socks().port());
 
-    // Kill every in-process listener -> the kernel must go offline, row kept.
+    // Close both protocols while their owning process is still running.
     api.stop();
     socks2.stop();
     socks().stop();
     h.engine->adoptDiscoveries(DiscoveryMode::Full);
     EXPECT_TRUE(h.waitStatus([&](const std::string& s) {
         return s.find(autoId) != std::string::npos &&
-               s.find("内核未启动") != std::string::npos;
+               s.find("等待 SOCKS5 或混合端口就绪") != std::string::npos;
     }, 3000));
 
     // Restore the shared mock for the tests that follow.
@@ -5182,10 +5184,15 @@ APS_TEST(engine, adaptive_automatic_round_does_not_reuse_manual_result_identity)
 APS_TEST(engine, adaptive_manual_socks_only_candidate_checks_its_own_port) {
     MockSocks5Server candidate;EXPECT_TRUE(candidate.start());
     Harness h;auto c=h.makeConfig();c.rules.clear();c.proxy.clashApi.host.clear();
-    auto kernel=makeKernel("verge-mihomo.exe",candidate.port(),0);
-    h.beforeStart=[kernel](Engine& engine){engine.seedDiscoveredKernelsForTest({kernel});};
-    h.start(c);
-    h.engine->requestNodeSwitchRound(kernel.id);
+    auto kernel=makeKernel("arbitrary-proxy.exe",candidate.port(),0);
+    kernel.pid = GetCurrentProcessId();
+    c.proxy.port = 1; // a generic listener still needs a click if the default is down
+    h.discoveryScan = [kernel](DiscoveryMode) { return std::vector<DiscoveredKernel>{kernel}; };
+    h.cacheLoader = [] { return std::vector<DiscoveredKernel>{}; };
+    h.start(c, true);
+    h.engine->adoptDiscoveries();
+    EXPECT_FALSE(h.engine->outletEnabled(kernel.id));
+    h.engine->requestNodeSwitchRound(kernel.id, true, "socks-click");
     EXPECT_TRUE(h.waitStatus([&](const std::string& s){
         auto row=outletStatusFor(s,kernel.id);const auto* msg=row.find("api_msg");
         return msg && msg->asString().find("握手正常")!=std::string::npos;
@@ -5193,9 +5200,16 @@ APS_TEST(engine, adaptive_manual_socks_only_candidate_checks_its_own_port) {
     const auto row=outletStatusFor(h.lastStatus(),kernel.id);
     EXPECT_TRUE(row.find("alive") && row.find("alive")->asBool());
     EXPECT_TRUE(row.find("selection_ok") && !row.find("selection_ok")->asBool());
+    EXPECT_TRUE(row.find("socks_only_ready") && row.find("socks_only_ready")->asBool());
     json::Value status;EXPECT_TRUE(json::Value::parse(h.engine->statusJson(),status,nullptr));
     EXPECT_TRUE(status.find("effective_proxy") && status.find("effective_proxy")->find("port") &&
-                status.find("effective_proxy")->find("port")->asInt()==socks().port());h.stop();
+                status.find("effective_proxy")->find("port")->asInt() == c.proxy.port);
+    c.routing.autoOutletId = kernel.id;
+    h.engine->reloadConfig(c);
+    EXPECT_TRUE(h.engine->outletEnabled(kernel.id));
+    EXPECT_EQ(h.engine->outletParams(kernel.id).proxy.port, candidate.port());
+    h.stop();
+    saveKernelCache({});
 }
 
 APS_TEST(engine, adaptive_service_prefix_and_directory_change_preserve_active_outlet) {
@@ -5413,7 +5427,83 @@ APS_TEST(engine, portless_cache_ambiguous_instances_do_not_steal_selected_outlet
     saveKernelCache({});
 }
 
+// Opt-in acceptance test against a supplied core executable. Each child gets
+// its own minimal DIRECT config, controller and workdir. The harness uses its
+// fake packet device and the scanner only sees this process and its children.
+static void verifyRealPortRepair(const std::wstring& exe, bool pipe) {
+    MockSocks5Server incumbent, reserve;
+    EXPECT_TRUE(incumbent.start());
+    EXPECT_TRUE(reserve.start());
+    const auto controller = reserve.port();
+    reserve.stop();
+    CreateDirectoryW(g_cache.directory.c_str(), nullptr);
+    const auto dir = g_cache.directory + (pipe ? L"\\mixed" : L"\\socks");
+    EXPECT_TRUE(CreateDirectoryW(dir.c_str(), nullptr) != FALSE);
+    const auto path = dir + L"\\core.yaml";
+    const auto pipeName = "\\\\.\\pipe\\aps-port-test-" + std::to_string(GetCurrentProcessId());
+    const auto portKey = pipe ? "mixed-port" : "socks-port";
+    const auto yaml = std::string(portKey) + ": " + std::to_string(incumbent.port()) +
+        "\nallow-lan: false\nmode: direct\nlog-level: silent\nrules:\n  - MATCH,DIRECT\n" +
+        (pipe ? "external-controller-pipe: '" + pipeName + "'\n" :
+                "external-controller: 127.0.0.1:" + std::to_string(controller) + "\n");
+    { std::ofstream out(path, std::ios::binary); out << yaml; }
+    std::wstring cmd = L"\"" + exe + L"\" -d \"" + dir + L"\" -f \"" + path + L"\"";
+    if (pipe) cmd += L" -ext-ctl-pipe " + utf8ToWide(pipeName);
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION child{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, dir.c_str(), &si, &child)) {
+        EXPECT_TRUE(false);
+        removeTree(dir);
+        return;
+    }
+    ClashApiClient api("127.0.0.1", pipe ? 0 : controller, "", pipe ? pipeName : "", child.dwProcessId);
+    for (int i = 0; i < 50 && !api.probeAny(100).reachable; ++i) Sleep(50);
+    Harness h;
+    auto c = h.makeConfig();
+    c.nodeMonitor.repairPortConflicts = false;
+    c.proxy.port = incumbent.port();
+    c.proxy.clashApi.host.clear();
+    c.nodeMonitor.intervalS = 3600;
+    c.subscription.autoRefresh = false;
+    h.cacheLoader = [] { return std::vector<DiscoveredKernel>{}; };
+    h.start(c, true);
+    EXPECT_TRUE(h.waitStatus([](const auto& s) { return s.find("被其他进程占用") != std::string::npos; }, 5000));
+    auto original = api.inboundPorts(500, child.dwProcessId);
+    EXPECT_EQ((pipe ? original.mixed : original.socks).value_or(1), 0);
+    c.nodeMonitor.repairPortConflicts = true;
+    h.engine->reloadConfig(c); // normal UI entry point, wake without a periodic tick
+    EXPECT_TRUE(h.waitStatus([](const auto& s) { return s.find("已自动更换运行端口") != std::string::npos; }, 6000));
+    auto repaired = api.inboundPorts(500, child.dwProcessId);
+    const auto replacement = (pipe ? repaired.mixed : repaired.socks).value_or(0);
+    EXPECT_NE(replacement, 0);
+    EXPECT_NE(replacement, incumbent.port());
+    const auto owned = listeningPortsOf(child.dwProcessId);
+    EXPECT_TRUE(std::find(owned.begin(), owned.end(), replacement) != owned.end());
+    EXPECT_TRUE(Socks5Client::probe({0x7f000001, replacement}, 500, nullptr, nullptr));
+    EXPECT_TRUE(Socks5Client::probe({0x7f000001, incumbent.port()}, 500, nullptr, nullptr));
+    EXPECT_EQ(h.engine->outletParams(kDefaultOutletId).proxy.port, incumbent.port());
+    h.engine->adoptDiscoveries();
+    auto unchanged = api.inboundPorts(500);
+    EXPECT_EQ((pipe ? unchanged.mixed : unchanged.socks).value_or(0), replacement);
+    std::ifstream saved(path, std::ios::binary);
+    EXPECT_STREQ(std::string((std::istreambuf_iterator<char>(saved)), {}), yaml);
+    saved.close();
+    h.stop();
+    TerminateProcess(child.hProcess, 0);
+    WaitForSingleObject(child.hProcess, 5000);
+    CloseHandle(child.hProcess); CloseHandle(child.hThread);
+    removeTree(dir);
+    saveKernelCache({});
+    std::printf("Core %s %s %u -> %u\n", pipe ? "pipe" : "TCP", portKey, incumbent.port(), replacement);
+}
+
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--verify-port-repair") {
+        verifyRealPortRepair(utf8ToWide(argv[2]), true);
+        verifyRealPortRepair(utf8ToWide(argv[2]), false);
+        return aps::test::failureCount() ? 1 : 0;
+    }
     if (argc > 1) {
         const std::string filter = argv[1];
         auto& cases = aps::test::registry();

@@ -46,7 +46,7 @@ constexpr int IDC_BTN_START = 101, IDC_BTN_STOP = 102, IDC_LBL_STATE = 103,
               IDC_CHK_COVERDIR = 125, IDC_BTN_SUBREFRESH = 126,
               IDC_CHK_DNSCLEAN = 127,
               IDC_BTN_OFFLINE = 128, IDC_LBL_EFFECTIVE = 129, IDC_BTN_SAVE_PROXY = 130,
-              IDC_NODE_PANE = 131,
+              IDC_NODE_PANE = 131, IDC_CHK_PORT_REPAIR = 132,
               IDC_BTN_SPEED_ROW = 2000,   // per-outlet speed buttons: 2000 + row
               IDC_LIST_RULES = 1001;
 
@@ -304,6 +304,10 @@ void MainWindow::buildUi() {
 
     // --- proxy group --------------------------------------------------------
     mkStatic(L"手动代理配置（自动发现的内核使用其实际端口）", 12, 48, 650, 20);
+    HWND repair = CreateWindowW(L"BUTTON", L"自动更换冲突的代理端口", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        Sc(670), Sc(46), Sc(305), Sc(23), hwnd_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CHK_PORT_REPAIR)), inst_, nullptr);
+    SendMessageW(repair, BM_SETCHECK, cfg_.cfg.nodeMonitor.repairPortConflicts ? BST_CHECKED : BST_UNCHECKED, 0);
     mkStatic(txt::kProxyHost, 12, 78, 80, 20);
     editHost_ = mkEdit(IDC_EDIT_HOST, 96, 76, 130, 22);
     mkStatic(txt::kProxyPort, 240, 78, 70, 20);
@@ -1215,12 +1219,16 @@ void MainWindow::refreshNodeStatus(const json::Value& engineOutlets,
             row.name = utf8ToWide(k.find("name") ? k.find("name")->asString()
                                                  : std::string());
             row.procName = row.name;
+            if (const auto* launcher = k.find("launcher"); launcher && !launcher->asString().empty())
+                row.name = utf8ToWide(launcher->asString()) + L"（" + row.procName + L"）";
             row.alive = !(k.find("alive") && !k.find("alive")->asBool());
             if (const auto* port = k.find("socks_port"); row.alive && port && port->asInt() > 0)
                 row.name += L":" + std::to_wstring(port->asInt());
             row.hasApi = k.find("api_port") && k.find("api_port")->asInt() != 0;
             if (auto has = k.find("has_api")) row.hasApi = has->asBool();
             if (auto error = k.find("discovery_error")) row.discoveryError = utf8ToWide(error->asString());
+            if (auto note = k.find("port_repair")) row.portRepair = utf8ToWide(note->asString());
+            row.running = k.find("running") ? k.find("running")->asBool() : row.alive || !row.discoveryError.empty();
             row.seen = !k.find("seen") || k.find("seen")->asBool();
             if (row.id.empty()) continue;
             fresh.push_back(std::move(row));
@@ -1256,12 +1264,12 @@ void MainWindow::ensureRowsFromConfig() {
     };
     std::set<std::string> visibleNames;
     for (const auto& k : kernels_) {
-        if (k.alive || required(k)) visibleNames.insert(nameKey(k));
+        if (k.running || required(k)) visibleNames.insert(nameKey(k));
     }
     std::vector<const KernelRow*> offlineRows;
     std::set<std::string> rememberedNames;
     for (const auto& k : kernels_) {
-        if (k.alive || required(k)) {
+        if (k.running || required(k)) {
             want.emplace_back(k.id, k.name.empty() ? k.id : k.name);
             continue;
         }
@@ -1492,7 +1500,12 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
                     pendingOutlet_.clear();
                     pendingOutletStarted_ = false;
                     pendingTestRequestId_.clear();
-                    if (api && alive && selected && runtimeMode != "direct" &&
+                    const bool socksOnly = matchingRequest && o.find("socks_only_ready") &&
+                        o.find("socks_only_ready")->asBool() &&
+                        std::any_of(kernels_.begin(), kernels_.end(), [&](const auto& k) {
+                            return k.id == id && k.alive && !k.hasApi;
+                        });
+                    if (alive && ((api && selected && runtimeMode != "direct") || socksOnly) &&
                         !isOutletActive(id)) activateOutletById(tested);
                     updateRadioChecks();
                 } else {
@@ -1508,17 +1521,33 @@ void MainWindow::applyEngineData(const json::Value& engineOutlets) {
     for (const auto& k : kernels_) {
         for (const auto& row : nodeRows_) {
             if (row.outletId != k.id) continue;
+            queueText(row.btnSpeed, k.alive && !k.hasApi ? L"连接 SOCKS5" : L"测试并连接");
             if (!k.alive && k.seen) {
-                queueText(row.lblStatus, L"内核未启动");
-                queueText(row.lblSwitch, L"");
+                queueText(row.lblStatus, k.running ? L"内核运行中，代理端口未就绪" : L"内核未启动");
+                queueText(row.lblSwitch, k.discoveryError.c_str());
                 queueText(row.lblMetadata, L"");
             } else if (k.alive && !k.hasApi) {
-                queueText(row.lblStatus, L"内核运行中；节点控制器未识别");
-                queueText(row.lblSwitch, k.discoveryError.empty()
-                    ? L"可检测当前出口的 SOCKS5 端口；节点状态暂不可查询"
-                    : k.discoveryError.c_str());
+                queueText(row.lblStatus, L"通用 SOCKS5 代理");
+                const bool testing = pendingOutlet_ == wideToUtf8(k.id);
+                queueText(row.lblSwitch, testing ? L"正在验证此出口…" : L"节点由代理程序管理");
+                for (size_t i = 0; !testing && i < engineOutlets.size(); ++i) {
+                    const auto& status = engineOutlets.at(i);
+                    const auto* id = status.find("id");
+                    const auto* request = status.find("test_request_id");
+                    const auto* msg = status.find("api_msg");
+                    if (id && utf8ToWide(id->asString()) == k.id && request && !request->asString().empty() && msg)
+                        queueText(row.lblSwitch, utf8ToWide(msg->asString()).c_str());
+                }
                 queueText(row.lblMetadata, L"");
             }
+        }
+    }
+    for (const auto& k : kernels_) {
+        if (k.portRepair.empty()) continue;
+        for (const auto& row : nodeRows_) if (row.outletId == k.id) {
+            auto& detail = pendingText[row.lblSwitch];
+            if (!detail.empty()) detail += L" · ";
+            detail += k.portRepair;
         }
     }
     for (const auto& entry : pendingText) setTextIfChanged(entry.first, entry.second.c_str());
@@ -1876,6 +1905,18 @@ LRESULT MainWindow::wndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_CHK_AUTOSWITCH:
                     toggleAutoSwitch();
                     return 0;
+                case IDC_CHK_PORT_REPAIR: {
+                    HWND control = GetDlgItem(hwnd_, IDC_CHK_PORT_REPAIR);
+                    const bool old = cfg_.cfg.nodeMonitor.repairPortConflicts;
+                    cfg_.cfg.nodeMonitor.repairPortConflicts = SendMessageW(control, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                    std::string error;
+                    if (!saveConfig(cfg_, &error)) {
+                        cfg_.cfg.nodeMonitor.repairPortConflicts = old;
+                        SendMessageW(control, BM_SETCHECK, old ? BST_CHECKED : BST_UNCHECKED, 0);
+                        MessageBoxW(hwnd_, msgWith(txt::kSaveFailed, error).c_str(), txt::kAppTitle, MB_ICONERROR);
+                    } else if (engine_ && engine_->connected()) engine_->sendReload();
+                    return 0;
+                }
                 case IDC_CHK_COVERDIR: {
                     bool on = SendMessageW(chkCoverDir_, BM_GETCHECK, 0, 0) ==
                               BST_CHECKED;

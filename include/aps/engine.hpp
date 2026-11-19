@@ -74,8 +74,8 @@ public:
     // outletId: "" = full round; otherwise only that outlet is probed.
     void requestNodeSwitchRound(const std::string& outletId = "", bool manual = true,
                                const std::string& requestId = "");
-    // Auto-discovery of running proxy kernels (Quick name-filtered scan by
-    // default). Public so tests can drive adoption deterministically.
+    // Verify changed endpoints and known candidates. Tests can drive
+    // adoption deterministically.
     void adoptDiscoveries(DiscoveryMode mode = DiscoveryMode::Quick);
     // Test seam: disable real machine scans inside the test harness (real
     // kernels running on a dev machine would leak into engine state).
@@ -143,7 +143,7 @@ public:
         for (const auto& k : kernels) {
             if (k.procName.empty()) continue;
             std::string id = k.id.empty() ? ("auto-" + k.procName) : k.id;
-            discovered_[id] = KernelEntry{k, true, true};
+            discovered_[id] = KernelEntry{k, k.socksPort != 0, true, true};
         }
     }
     // Test seam: replace the machine scan inside adoptDiscoveries (the real
@@ -204,6 +204,7 @@ private:
         // old node over the in-flight switch.
         bool switching = false;
         bool selectionSatisfied = true; // manual result met region/class filters
+        bool socksOnlyReady = false;    // explicit test of this controller-less outlet
         std::string region;             // same detected/inferred region used for selection
         std::string testRequestId;      // correlates a GUI click with its own result
         // Region preference state: which region string the current node was
@@ -374,13 +375,14 @@ private:
     // controller 39797 wiped the main instance's 7897/39798 pairing).
     struct KernelEntry {
         DiscoveredKernel kernel;
-        bool alive = false;
+        bool alive = false;  // usable SOCKS endpoint
         // True once a completed scan has observed this entry (found it, or
         // confirmed it missing). The GUI blocks clicks only on
         // CONFIRMED-dead rows — never during the brief "detecting" window
         // right after an engine start, where cached kernels are seeded
         // unverified (clicks then run a real probe instead of a dialog).
         bool verified = false;
+        bool running = false; // process observed in this scan, even without an outlet
     };
     std::mutex discMu_;
     std::map<std::string, KernelEntry> discovered_;
@@ -403,6 +405,16 @@ private:
         cfwProfileFinder_;  // test seam
     std::function<std::vector<DiscoveredKernel>(DiscoveryMode)>
         discoveryScan_;  // test seam
+    std::mutex scanMu_;
+    DiscoverySnapshot scanSnapshot_;
+    struct PortRepair {
+        uint16_t oldPort = 0, replacement = 0;
+        ProxyPortKind kind = ProxyPortKind::Mixed;
+        uint64_t nextAttempt = 0;
+        std::string message;
+    };
+    std::map<uint32_t, PortRepair> portRepairs_; // serialized by scanMu_
+    std::atomic<bool> repairScanRequested_{false};
     int fullScanCountdown_ = 0;        // ticks until the next blind full scan
     std::atomic<uint64_t> unresolvedCount_{0};
     std::atomic<int64_t> degradedSinceMs_{0};

@@ -65,6 +65,7 @@ bool importProfileJson(const std::string& text, const Config& current, Config& o
     }
     // Activation is machine-local (kernel ids differ per machine).
     imported.routing.autoOutletId.clear();
+    imported.nodeMonitor.repairPortConflicts = current.nodeMonitor.repairPortConflicts;
 
     std::string verr;
     if (!imported.validate(&verr)) {

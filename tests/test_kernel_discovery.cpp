@@ -8,11 +8,13 @@
 
 #include "aps/kernel_discovery.hpp"
 #include "aps/clash_api.hpp"
+#include "aps/json.hpp"
 #include "aps/kernel_config.hpp"
 #include "aps/path_util.hpp"
 #include "aps/string_util.hpp"
 #include <fstream>
 #include "mock_clash_api.hpp"
+#include "mock_http_server.hpp"
 #include "mock_clash_pipe.hpp"
 #include "mock_socks_server.hpp"
 #include "kernel_cache_sandbox.hpp"
@@ -87,7 +89,6 @@ APS_TEST(kdiscovery, full_mode_finds_socks_and_api_pair) {
     EXPECT_TRUE(api.start());
     // NOTE: mocks run in THIS process, so both ports share our PID. The
     // discovery should group them into ONE kernel with both ports set.
-    // Full mode is required: the test exe name matches no kernel pattern.
     auto kernels = discoverProxyKernels(800, DiscoveryMode::Full);
     bool found = false;
     for (const auto& k : kernels) {
@@ -102,20 +103,39 @@ APS_TEST(kdiscovery, full_mode_finds_socks_and_api_pair) {
     socks.stop();
 }
 
-APS_TEST(kdiscovery, quick_mode_skips_unknown_names) {
-    // The mocks' process name ("test_kernel_discovery.exe") matches no
-    // built-in kernel pattern, so Quick mode must NOT probe (and thus not
-    // find) them. This is the filter that makes re-scans instant.
+APS_TEST(kdiscovery, changed_scan_finds_new_socks_and_skips_unchanged_http) {
+    saveKernelCache({});
+    DiscoverySnapshot snapshot;
+    aps::test::MockHttpServer http;
+    http.setResponse(R"({"version":"1.2.3"})");
+    EXPECT_TRUE(http.start());
+    const auto pid = GetCurrentProcessId();
+    auto containsSelf = [&](const auto& found) {
+        return std::any_of(found.begin(), found.end(), [&](const auto& k) { return k.pid == pid; });
+    };
+    EXPECT_FALSE(containsSelf(discoverProxyKernels(250, DiscoveryMode::Full, &snapshot)));
+    const auto hits = http.hits();
+    EXPECT_FALSE(containsSelf(discoverProxyKernels(250, DiscoveryMode::Changed, &snapshot)));
+    EXPECT_EQ(http.hits(), hits);
     MockSocks5Server socks;
     EXPECT_TRUE(socks.start());
-    MockClashApi api;
-    EXPECT_TRUE(api.start());
-    auto kernels = discoverProxyKernels(800, DiscoveryMode::Quick);
-    for (const auto& k : kernels) {
-        EXPECT_TRUE(k.socksPort != socks.port() || k.apiPort != api.port());
+    auto found = discoverProxyKernels(250, DiscoveryMode::Changed, &snapshot);
+    EXPECT_TRUE(containsSelf(found));
+    for (const auto& k : found) if (k.pid == pid) {
+        EXPECT_EQ(k.socksPort, socks.port());
+        EXPECT_FALSE(k.hasApi());
     }
-    api.stop();
     socks.stop();
+    found = discoverProxyKernels(250, DiscoveryMode::Changed, &snapshot);
+    EXPECT_TRUE(containsSelf(found));
+    for (const auto& k : found) if (k.pid == pid) {
+        EXPECT_EQ(k.socksPort, 0);
+        EXPECT_FALSE(k.discoveryError.empty());
+    }
+    EXPECT_TRUE(socks.start());
+    found = discoverProxyKernels(250, DiscoveryMode::Changed, &snapshot);
+    EXPECT_TRUE(containsSelf(found));
+    for (const auto& k : found) if (k.pid == pid) EXPECT_EQ(k.socksPort, socks.port());
 }
 
 APS_TEST(kdiscovery, parse_config_dir_from_cmdline) {
@@ -213,8 +233,67 @@ APS_TEST(kdiscovery, occupied_port_is_reported_never_borrowed_from_other_pid) {
         EXPECT_EQ(k.socksPort, 0);
         EXPECT_TRUE(k.hasApi());
         EXPECT_TRUE(k.discoveryError.find("被其他进程占用") != std::string::npos);
+        EXPECT_EQ(k.conflictOwner, GetCurrentProcessId());
+        EXPECT_EQ(k.conflictPort, other.port());
     }
     EXPECT_TRUE(found);
+}
+
+APS_TEST(kdiscovery, automatic_port_repair_requires_fresh_conflict_and_verified_listener) {
+    MockSocks5Server incumbent;
+    EXPECT_TRUE(incumbent.start());
+    PipeKernelFixture fixture(false, incumbent.port());
+    EXPECT_TRUE(fixture.started);
+    auto rows = discoverProxyKernels(250, DiscoveryMode::Full);
+    auto it = std::find_if(rows.begin(), rows.end(), [&](const auto& k) { return k.pid == fixture.process.dwProcessId; });
+    EXPECT_TRUE(it != rows.end());
+    if (it == rows.end()) return;
+    auto stale = *it;
+    stale.conflictOwner = 4;
+    EXPECT_FALSE(repairConflictingProxyPort(stale));
+    EXPECT_EQ(stale.socksPort, 0);
+    EXPECT_FALSE(ClashApiClient("127.0.0.1", 0, "", it->apiPipe, GetCurrentProcessId())
+                     .changeInboundPort(ProxyPortKind::Mixed, incumbent.port(), GetCurrentProcessId()));
+    EXPECT_TRUE(repairConflictingProxyPort(*it, incumbent.port())); // occupied preference falls back
+    EXPECT_NE(it->socksPort, incumbent.port());
+    EXPECT_NE(it->socksPort, 0);
+    const auto owned = listeningPortsOf(it->pid);
+    EXPECT_TRUE(std::find(owned.begin(), owned.end(), it->socksPort) != owned.end());
+    EXPECT_FALSE(repairConflictingProxyPort(*it));
+    EXPECT_TRUE(it->discoveryError.empty());
+    EXPECT_TRUE(hasLoopbackListener(incumbent.port()));
+}
+
+APS_TEST(kdiscovery, controller_ack_without_new_socks_listener_preserves_conflict) {
+    PipeKernelFixture incumbent(true);
+    EXPECT_TRUE(incumbent.started);
+    auto rows = discoverProxyKernels(250, DiscoveryMode::Full);
+    const auto it = std::find_if(rows.begin(), rows.end(), [&](const auto& k) { return k.pid == incumbent.process.dwProcessId; });
+    EXPECT_TRUE(it != rows.end());
+    if (it == rows.end()) return;
+    const auto port = it->socksPort;
+    std::atomic<int> patches{0};
+    aps::test::MockClashPipe api;
+    api.respond = [&](const auto& req) -> std::string {
+        if (req.starts_with("PATCH /configs ")) {
+            ++patches;
+            return "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        }
+        const auto body = "{\"mode\":\"rule\",\"socks-port\":" + std::to_string(port) + "}";
+        return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    };
+    EXPECT_TRUE(api.start());
+    DiscoveredKernel k;
+    k.pid = GetCurrentProcessId();
+    k.apiPipe = api.name;
+    k.conflictKind = ProxyPortKind::Socks;
+    k.conflictOwner = it->pid;
+    k.conflictPort = port;
+    EXPECT_FALSE(repairConflictingProxyPort(k));
+    EXPECT_EQ(patches.load(), 1);
+    EXPECT_EQ(k.conflictPort, port);
+    EXPECT_EQ(k.socksPort, 0);
+    EXPECT_TRUE(k.repairMessage.find("未通过 SOCKS5 验证") != std::string::npos);
 }
 
 APS_TEST(kdiscovery, opaque_service_launch_recovers_verified_cached_pipe) {
@@ -300,7 +379,7 @@ APS_TEST(kdiscovery, process_named_pipe_requires_valid_version_not_just_auth_or_
         };
         EXPECT_TRUE(pipe.start(0, "\\\\.\\pipe\\" + stem));
         for (const auto& k : discoverProxyKernels(250, DiscoveryMode::Full))
-            EXPECT_NE(k.pid, GetCurrentProcessId()); // unknown SOCKS-only stays rejected
+            if (k.pid == GetCurrentProcessId()) EXPECT_FALSE(k.hasApi());
     }
 }
 
@@ -394,31 +473,32 @@ APS_TEST(kdiscovery, unknown_tcp_core_reads_its_own_config_secret) {
     EXPECT_TRUE(found);
 }
 
-APS_TEST(kdiscovery, api_only_responder_is_rejected) {
-    // Regression: local HTTP services (node.exe dev servers, DSH Desktop
-    // backends, ...) answered GET /version with a 200 and were adopted as
-    // kernels. A controller requires a Clash-style /version JSON payload,
-    // and a kernel requires a SOCKS port — an API-only responder is junk.
+APS_TEST(kdiscovery, verified_tcp_controller_without_socks_is_diagnostic_only) {
     MockClashApi api;
     EXPECT_TRUE(api.start());
     auto kernels = discoverProxyKernels(800, DiscoveryMode::Full);
-    for (const auto& k : kernels) {
-        EXPECT_TRUE(k.pid != GetCurrentProcessId());
-        EXPECT_TRUE(k.socksPort != 0 || (!k.apiPipe.empty() && !k.discoveryError.empty()));
+    bool found = false;
+    for (const auto& k : kernels) if (k.pid == GetCurrentProcessId()) {
+        found = true;
+        EXPECT_EQ(k.socksPort, 0);
+        EXPECT_EQ(k.apiPort, api.port());
+        EXPECT_FALSE(k.discoveryError.empty());
     }
+    EXPECT_TRUE(found);
     api.stop();
 }
 
-APS_TEST(kdiscovery, unknown_name_socks_only_is_rejected) {
-    // A lone SOCKS responder with a name no filter has ever seen is not
-    // evidence of an airport kernel: the Full blind scan requires BOTH
-    // ports from unknown names (this also keeps junk out of the cache).
+APS_TEST(kdiscovery, unknown_name_socks_only_is_an_outlet_without_a_controller) {
     MockSocks5Server socks;
     EXPECT_TRUE(socks.start());
     auto kernels = discoverProxyKernels(800, DiscoveryMode::Full);
-    for (const auto& k : kernels) {
-        EXPECT_TRUE(k.pid != GetCurrentProcessId());
+    bool found = false;
+    for (const auto& k : kernels) if (k.pid == GetCurrentProcessId()) {
+        found = true;
+        EXPECT_EQ(k.socksPort, socks.port());
+        EXPECT_FALSE(k.hasApi());
     }
+    EXPECT_TRUE(found);
     socks.stop();
 }
 
@@ -548,12 +628,14 @@ APS_TEST(kdiscovery, timing_benchmark) {
     // machine load varies. Quick must stay near-instant (production path).
     LARGE_INTEGER t0, t1, freq;
     QueryPerformanceFrequency(&freq);
+    DiscoverySnapshot snapshot;
+    auto full = discoverProxyKernels(250, DiscoveryMode::Full, &snapshot);
     QueryPerformanceCounter(&t0);
-    auto quick = discoverProxyKernels(250, DiscoveryMode::Quick);
+    auto quick = discoverProxyKernels(250, DiscoveryMode::Changed, &snapshot);
     QueryPerformanceCounter(&t1);
     double quickMs = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
     QueryPerformanceCounter(&t0);
-    auto full = discoverProxyKernels(250, DiscoveryMode::Full);
+    full = discoverProxyKernels(250, DiscoveryMode::Full, &snapshot);
     QueryPerformanceCounter(&t1);
     double fullMs = (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
     std::printf("[bench] Quick=%zu kernels %.0f ms | Full=%zu kernels %.0f ms\n",
@@ -577,6 +659,24 @@ int main(int argc, char** argv) {
         MockClashApi api;
         api.secret = "fixture-secret";
         MockSocks5Server socks;
+        if (readKernelLaunchConfig(wideToUtf8(GetCommandLineW())).mixedPort) {
+            pipe.respond = [&](const std::string& request) -> std::string {
+                std::string body;
+                if (request.starts_with("GET /version ")) body = R"({"version":"fixture"})";
+                else if (request.starts_with("GET /configs "))
+                    body = R"({"mode":"rule","mixed-port":0,"socks-port":0})";
+                else if (request.starts_with("PATCH /configs ")) {
+                    json::Value patch;
+                    const auto split = request.find("\r\n\r\n");
+                    if (split == std::string::npos || !json::Value::parse(request.substr(split + 4), patch, nullptr) ||
+                        !patch.find("mixed-port") || patch.object().size() != 1 ||
+                        !socks.start(static_cast<uint16_t>(patch.find("mixed-port")->asInt())))
+                        return "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+                    return "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+                }
+                return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+            };
+        }
         HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, utf8ToWide(argv[2]).c_str());
         HANDLE quit = OpenEventW(SYNCHRONIZE, FALSE, utf8ToWide(argv[3]).c_str());
         bool controllerStarted = std::string(argv[1]) == "--tcp-fixture" ? api.start() : pipe.start(0, flags.pipe);
@@ -584,6 +684,7 @@ int main(int argc, char** argv) {
         if (std::string(argv[4]) == "yes" && !socks.start()) return 3;
         SetEvent(ready);
         WaitForSingleObject(quit, 30000);
+        pipe.stop();
         CloseHandle(ready);
         CloseHandle(quit);
         return 0;

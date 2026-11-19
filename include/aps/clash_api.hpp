@@ -13,6 +13,11 @@
 
 namespace aps {
 
+enum class ProxyPortKind;
+struct ClashInboundPorts {
+    std::optional<uint16_t> mixed, socks;
+};
+
 struct ClashApiResult {
     bool ok = false;
     int httpStatus = 0;
@@ -61,6 +66,12 @@ public:
         int httpStatus = 0;
     };
     ProbeResult probeAny(int timeoutMs = 1000);
+    bool hasProxyInventory(int timeoutMs);
+    // Additional protocol evidence for a TCP controller with no live SOCKS
+    // endpoint. A failed bind can also be reported as a zero runtime port.
+    std::optional<uint16_t> configuredProxyPort(int timeoutMs);
+    ClashInboundPorts inboundPorts(int timeoutMs, uint32_t expectedTcpPid = 0);
+    bool changeInboundPort(ProxyPortKind kind, uint16_t port, uint32_t expectedPid);
 
     // GET /proxies with optional /configs and /rules runtime metadata.
     // Rule mode resolves selected nested selectors used by actual rules;
@@ -103,7 +114,7 @@ public:
 
 private:
     ClashApiResult request(const std::string& method, const std::string& path,
-                           const std::string& body, int timeoutMs);
+                           const std::string& body, int timeoutMs, uint32_t expectedTcpPid = 0);
 
     std::string host_;
     uint16_t port_;

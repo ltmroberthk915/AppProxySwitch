@@ -12,6 +12,7 @@
 
 #include "aps/json.hpp"
 #include "aps/clash_pipe.hpp"
+#include "aps/kernel_discovery.hpp"
 #include "aps/path_util.hpp"
 #include "aps/string_util.hpp"
 
@@ -19,11 +20,33 @@ namespace aps {
 
 namespace {
 
+// Pin the server side of this connected loopback socket before sending the
+// request. Checking just the listening port leaves a rebind window.
+bool peerOwnedBy(SOCKET socket, const sockaddr_in& peer, uint32_t pid) {
+    sockaddr_in local{};
+    int len = sizeof(local);
+    if (getsockname(socket, reinterpret_cast<sockaddr*>(&local), &len) != 0) return false;
+    ULONG size = 0;
+    if (GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0)
+        != ERROR_INSUFFICIENT_BUFFER) return false;
+    std::vector<uint8_t> bytes(size);
+    if (GetExtendedTcpTable(bytes.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0)
+        != NO_ERROR) return false;
+    auto* rows = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(bytes.data());
+    for (DWORD i = 0; i < rows->dwNumEntries; ++i) {
+        const auto& r = rows->table[i];
+        if (r.dwOwningPid == pid && r.dwState == MIB_TCP_STATE_ESTAB &&
+            r.dwLocalAddr == peer.sin_addr.s_addr && r.dwLocalPort == peer.sin_port &&
+            r.dwRemoteAddr == local.sin_addr.s_addr && r.dwRemotePort == local.sin_port) return true;
+    }
+    return false;
+}
+
 std::string httpRequest(const std::string& host, uint16_t port,
                         const std::string& method, const std::string& path,
                         const std::string& secret, const std::string& body,
                         int timeoutMs, ClashApiResult& out,
-                        const std::string& pipe, uint32_t pipePid) {
+                        const std::string& pipe, uint32_t pipePid, uint32_t expectedTcpPid) {
     if (secret.find_first_of("\r\n") != std::string::npos) {
         out.error = "invalid controller secret";
         return {};
@@ -70,6 +93,11 @@ std::string httpRequest(const std::string& host, uint16_t port,
     nb = 0;
     ioctlsocket(s, FIONBIO, &nb);
 
+    if (expectedTcpPid && !peerOwnedBy(s, sa, expectedTcpPid)) {
+        closesocket(s);
+        out.error = "controller socket owner mismatch";
+        return {};
+    }
     if (net::sendAll(s, req.data(), req.size(), timeoutMs) != 0) {
         closesocket(s);
         out.error = "controller send failed";
@@ -143,10 +171,10 @@ ClashApiClient::ClashApiClient(std::string host, uint16_t port, std::string secr
 
 ClashApiResult ClashApiClient::request(const std::string& method,
                                        const std::string& path,
-                                       const std::string& body, int timeoutMs) {
+                                       const std::string& body, int timeoutMs, uint32_t expectedTcpPid) {
     ClashApiResult r;
     std::string resp = httpRequest(host_, port_, method, path, secret_, body,
-                                   timeoutMs, r, pipe_, pipePid_);
+                                   timeoutMs, r, pipe_, pipePid_, expectedTcpPid);
     if (r.error.empty() && r.httpStatus == 0) {
         r.error = "no HTTP status";
     }
@@ -188,6 +216,48 @@ ClashApiClient::ProbeResult ClashApiClient::probeAny(int timeoutMs) {
     p.needSecret = r.httpStatus == 401 || r.httpStatus == 403;
     p.reachable = p.needSecret || (r.ok && looksLikeClashVersion(r.body));
     return p;
+}
+
+bool ClashApiClient::hasProxyInventory(int timeoutMs) {
+    const auto response = request("GET", "/proxies", "", timeoutMs);
+    json::Value root;
+    if (!response.ok || !json::Value::parse(response.body, root, nullptr)) return false;
+    const auto* proxies = root.find("proxies");
+    if (!proxies || !proxies->isObject()) return false;
+    for (const auto& entry : proxies->object()) {
+        const auto* type = entry.second.find("type");
+        if (type && type->isString() && !type->asString().empty()) return true;
+    }
+    return false;
+}
+
+std::optional<uint16_t> ClashApiClient::configuredProxyPort(int timeoutMs) {
+    const auto ports = inboundPorts(timeoutMs);
+    return ports.mixed.value_or(0) || !ports.socks ? ports.mixed : ports.socks;
+}
+
+ClashInboundPorts ClashApiClient::inboundPorts(int timeoutMs, uint32_t expectedTcpPid) {
+    const auto response = request("GET", "/configs", "", timeoutMs, expectedTcpPid);
+    json::Value config;
+    if (!response.ok || !json::Value::parse(response.body, config, nullptr)) return {};
+    const auto* mode = config.find("mode");
+    if (!mode || !mode->isString()) return {};
+    auto port = [&](const char* key) -> std::optional<uint16_t> {
+        const auto* value = config.find(key);
+        if (!value || !value->isNumber()) return {};
+        const auto n = value->asNumber();
+        if (n < 0 || n > 65535 || static_cast<uint16_t>(n) != n) return {};
+        return static_cast<uint16_t>(n);
+    };
+    return {port("mixed-port"), port("socks-port")};
+}
+
+bool ClashApiClient::changeInboundPort(ProxyPortKind kind, uint16_t port, uint32_t expectedPid) {
+    if (!port || !expectedPid || host_ != "127.0.0.1" || (!pipe_.empty() && pipePid_ != expectedPid)) return false;
+    auto body = json::Value::makeObject();
+    body.set(kind == ProxyPortKind::Mixed ? "mixed-port" : "socks-port", static_cast<uint32_t>(port));
+    const auto result = request("PATCH", "/configs", body.dump(), 750, expectedPid);
+    return result.httpStatus >= 200 && result.httpStatus < 300;
 }
 
 std::optional<ClashGroup> ClashApiClient::currentSelectorGroup(

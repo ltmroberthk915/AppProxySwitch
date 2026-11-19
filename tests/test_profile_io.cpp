@@ -52,6 +52,7 @@ APS_TEST(profile, export_omits_secrets) {
 
 APS_TEST(profile, import_roundtrip_keeps_local_secrets) {
     Config current = baseConfig();
+    current.nodeMonitor.repairPortConflicts = false;
     current.setPlainPassword("local-pass");
     current.proxy.clashApi.secretEnc = "LOCAL-CLASH";
     current.outlets[0].passwordEnc = "LOCAL-OUTLET-PASS";
@@ -60,6 +61,7 @@ APS_TEST(profile, import_roundtrip_keeps_local_secrets) {
     // The file (exported from another machine) has no secrets.
     Config other = baseConfig();
     other.proxy.port = 7899;
+    other.nodeMonitor.repairPortConflicts = true;
     other.rules[0].action = "proxy";
     std::string text = exportProfileJson(other);
 
@@ -68,6 +70,7 @@ APS_TEST(profile, import_roundtrip_keeps_local_secrets) {
     EXPECT_TRUE(importProfileJson(text, current, out, &err));
     // File fields win...
     EXPECT_EQ(out.proxy.port, 7899);
+    EXPECT_FALSE(out.nodeMonitor.repairPortConflicts);
     EXPECT_STREQ(out.rules[0].action, "proxy");
     // ...local secrets are kept (enc blobs compared verbatim).
     EXPECT_TRUE(out.proxy.passwordEnc == current.proxy.passwordEnc);

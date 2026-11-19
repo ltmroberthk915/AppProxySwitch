@@ -164,6 +164,7 @@ struct AdvancedSettings {
 
 // Node health monitoring (Clash controller API) settings.
 struct NodeMonitorSettings {
+    bool repairPortConflicts = true;
     bool enabled = true;              // auto-switch master switch
     int intervalS = 60;               // poll interval
     int failThreshold = 2;            // consecutive failures before switching

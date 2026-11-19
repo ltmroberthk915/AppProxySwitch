@@ -66,6 +66,7 @@ APS_TEST(config, recognized_legacy_node_preferences_do_not_count_as_unknown_fiel
     Config config;
     EXPECT_TRUE(Config::fromJson(value, config, &error, &warnings));
     EXPECT_TRUE(warnings.empty());
+    EXPECT_TRUE(config.nodeMonitor.repairPortConflicts);
     EXPECT_TRUE(config.nodeMonitor.regions == std::vector<std::string>{"US"});
     EXPECT_TRUE(config.nodeMonitor.nodeClasses == std::vector<std::string>{"RES"});
 }
@@ -91,6 +92,8 @@ APS_TEST(config, json_roundtrip) {
     c.rules.push_back(r);
     c.proxy.port = 7890;
     c.proxy.username = "user";
+    EXPECT_TRUE(c.nodeMonitor.repairPortConflicts);
+    c.nodeMonitor.repairPortConflicts = false;
     c.setPlainPassword("secret");
     c.failMode = "closed";
 
@@ -101,6 +104,7 @@ APS_TEST(config, json_roundtrip) {
     EXPECT_TRUE(Config::fromJson(j, back, &err, &warnings));
     if (!err.empty()) std::printf("    err: %s\n", err.c_str());
     EXPECT_EQ(back.proxy.port, 7890);
+    EXPECT_FALSE(back.nodeMonitor.repairPortConflicts);
     EXPECT_EQ(back.rules.size(), 1u);
     EXPECT_STREQ(back.rules[0].path, "C:\\Apps\\Telegram\\Telegram.exe");
     EXPECT_TRUE(back.rules[0].enabled);

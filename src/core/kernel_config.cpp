@@ -63,6 +63,14 @@ uint16_t port(const std::string& s) {
     return r.ec == std::errc{} && r.ptr == s.data() + s.size() && n <= 65535
                ? static_cast<uint16_t>(n) : 0;
 }
+uint16_t localControllerPort(const std::string& endpoint) {
+    const auto colon = endpoint.rfind(':');
+    if (colon == std::string::npos) return 0;
+    const auto host = endpoint.substr(0, colon);
+    if (!host.empty() && host != "127.0.0.1" && host != "localhost" &&
+        host != "0.0.0.0" && host != "[::]") return 0;
+    return port(endpoint.substr(colon + 1));
+}
 }
 
 KernelLaunchConfig parseKernelLaunchConfig(const std::string& cmdline,
@@ -79,7 +87,7 @@ KernelLaunchConfig parseKernelLaunchConfig(const std::string& cmdline,
                 auto eq = key.find('=');
                 auto flag = key.substr(0, eq);
                 if (flag != "-d" && flag != "-f" && flag != "-secret" &&
-                    flag != "-ext-ctl-pipe") continue;
+                    flag != "-ext-ctl-pipe" && flag != "-ext-ctl") continue;
                 if (eq != std::string::npos) flags[flag] = key.substr(eq + 1);
                 else if (i + 1 < argc) flags[flag] = wideToUtf8(args[++i]);
             }
@@ -109,11 +117,13 @@ KernelLaunchConfig parseKernelLaunchConfig(const std::string& cmdline,
         auto key = trim(line.substr(0, colon));
         auto value = scalar(line.substr(colon + 1));
         if (key == "external-controller-pipe") out.pipe = value;
+        else if (key == "external-controller") out.controllerPort = localControllerPort(value);
         else if (key == "secret") out.secret = value;
         else if (key == "mixed-port") out.mixedPort = port(value);
         else if (key == "socks-port") out.socksPort = port(value);
     }
     if (!flags["-ext-ctl-pipe"].empty()) out.pipe = flags["-ext-ctl-pipe"];
+    if (!flags["-ext-ctl"].empty()) out.controllerPort = localControllerPort(flags["-ext-ctl"]);
     if (!flags["-secret"].empty()) out.secret = flags["-secret"];
     return out;
 }

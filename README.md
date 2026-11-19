@@ -1,5 +1,7 @@
 # AppProxySwitch
 
+**1.3.10** 支持按 SOCKS5 协议和监听进程识别新代理。Clash/Mihomo 内核发生端口冲突时，APS 默认自动分配可用端口并在界面显示结果。[版本说明](docs/RELEASE-1.3.10-PROXY-DISCOVERY.md)
+
 **1.3.9：** 修正外网回包的入站注入方向及每条连接的网卡归属；本机环回保持原路径。合成断开包不再跨线程借用其他连接的元数据。此次中断的因果关系及加速器共存仍需实机验收。见[版本说明](docs/RELEASE-1.3.9-TCP-RETURN-PATH.md)。
 
 **1.3.7 界面热修候选：** 修复1.3.6刷新时先重置控件、再布局和滚动造成的整窗闪烁抖动。只批量提交最终位置，跳过无变化的布局和文字；保留实时统计。请使用1.3.7替代1.3.6界面候选。详见[版本说明](docs/RELEASE-1.3.7-REFRESH-JITTER.md)及[验证记录](docs/VALIDATION-1.3.7.md)。
@@ -11,11 +13,11 @@
 Windows 按应用网络路由管理工具。将指定程序的 TCP 连接转发到本地 SOCKS5
 出口，支持独立规则、多出口、内核自动发现和活动连接查看。
 
-当前版本：**1.3.2**。
+当前版本为 **1.3.10**。
 
 ## 下载
 
-在 [1.3.2 发布页](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.2)
+在 [1.3.10 发布页](https://github.com/ltmroberthk915/AppProxySwitch/releases/tag/v1.3.10)
 下载 Windows x64 安装包或便携包。升级前正常停止引擎并从托盘退出程序。
 
 ## 1.3.2 更新

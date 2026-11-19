@@ -123,7 +123,9 @@ private:
         std::wstring name;
         std::wstring procName;
         bool alive = true;
+        bool running = false;
         std::wstring discoveryError;
+        std::wstring portRepair;
         bool hasApi = false;   // controller port found (probe-able)
         // Confirmed by a completed engine scan (found OR confirmed missing).
         // Unverified rows are the brief post-start window: clicks must run

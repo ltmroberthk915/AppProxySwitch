@@ -203,6 +203,7 @@ json::Value Config::toJson() const {
 
     json::Value nm = json::Value::makeObject();
     nm.set("enabled", nodeMonitor.enabled);
+    nm.set("repair_port_conflicts", nodeMonitor.repairPortConflicts);
     nm.set("interval_s", nodeMonitor.intervalS);
     nm.set("fail_threshold", nodeMonitor.failThreshold);
     nm.set("delay_url", nodeMonitor.delayUrl);
@@ -410,7 +411,7 @@ bool Config::fromJson(const json::Value& v, Config& out, std::string* error,
     const json::Value* nm = v.find("node_monitor");
     if (nm) {
         if (!nm->isObject()) { if (error) *error = "'node_monitor' must be an object"; return false; }
-        static const char* kN[] = {"enabled", "interval_s", "fail_threshold",
+        static const char* kN[] = {"enabled", "repair_port_conflicts", "interval_s", "fail_threshold",
                                    "delay_url", "delay_timeout_ms",
                                    "max_latency_ms", "regions", "node_classes",
                                    "region", "node_class",
@@ -419,6 +420,7 @@ bool Config::fromJson(const json::Value& v, Config& out, std::string* error,
                                    "bad_node_cooldown_s"};
         noteUnknownKeys(*nm, "node_monitor", kN, std::size(kN), warnings);
         if (!getBool(*nm, "enabled", out.nodeMonitor.enabled, error)) return false;
+        if (!getBool(*nm, "repair_port_conflicts", out.nodeMonitor.repairPortConflicts, error)) return false;
         if (!getInt(*nm, "interval_s", out.nodeMonitor.intervalS, 10, 3600, error)) return false;
         if (!getInt(*nm, "fail_threshold", out.nodeMonitor.failThreshold, 1, 10, error)) return false;
         if (!getStr(*nm, "delay_url", out.nodeMonitor.delayUrl, error)) return false;

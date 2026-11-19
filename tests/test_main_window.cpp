@@ -307,7 +307,7 @@ APS_TEST(mainwindow, unchanged_node_status_has_no_placeholder_text_roundtrip) {
     EXPECT_EQ(trace.textWrites,0);
     EXPECT_EQ(trace.geometryChanges,0);
     EXPECT_EQ(trace.backgroundErases,0);
-    EXPECT_TRUE(hasText(f.hwnd(),L"内核运行中；节点控制器未识别"));
+    EXPECT_TRUE(hasText(f.hwnd(),L"通用 SOCKS5 代理"));
     EXPECT_EQ(mutations,0);
 }
 
@@ -614,7 +614,50 @@ APS_TEST(mainwindow, test_uses_runtime_port_without_reloading_manual_settings) {
 APS_TEST(mainwindow, socks_only_kernel_does_not_claim_endless_detection) {
     WindowFixture f;
     f.window->onPipeMessage(R"({"type":"STATS","kernels":[{"id":"auto-test","name":"core.exe","alive":true,"seen":true,"api_port":0,"has_api":false}],"outlets":[]})");
-    EXPECT_TRUE(hasText(f.hwnd(), L"内核运行中；节点控制器未识别"));
+    EXPECT_TRUE(hasText(f.hwnd(), L"通用 SOCKS5 代理"));
+}
+
+APS_TEST(mainwindow, running_conflict_visible_then_recovers_in_place) {
+    WindowFixture f;
+    aps::json::Value value;
+    aps::json::Value::parse(R"({"type":"STATS","kernels":[{"id":"auto-new","name":"arbitrary.exe","launcher":"app.exe","running":true,"alive":false,"seen":true,"has_api":true,"discovery_error":"代理端口 7897 被其他进程占用（other.exe，PID 12）"}],"outlets":[]})", value, nullptr);
+    f.window->onPipeMessage(value.dump());
+    auto name = findText(f.hwnd(), L"app.exe（arbitrary.exe）");
+    EXPECT_TRUE(name != nullptr);
+    EXPECT_TRUE(hasText(f.hwnd(), L"内核运行中，代理端口未就绪"));
+    EXPECT_TRUE(hasText(f.hwnd(), L"代理端口 7897 被其他进程占用（other.exe，PID 12）"));
+    auto k = value.find("kernels")->at(0);
+    k.set("alive", true); k.set("socks_port", 19100); k.set("discovery_error", "");
+    k.set("port_repair", "已自动更换运行端口：7897 → 19100");
+    auto rows = aps::json::Value::makeArray(); rows.append(k); value.set("kernels", rows);
+    f.window->onPipeMessage(value.dump());
+    EXPECT_TRUE(findText(f.hwnd(), L"app.exe（arbitrary.exe）:19100") == name);
+    EXPECT_TRUE(hasText(f.hwnd(), L"已自动更换运行端口：7897 → 19100"));
+    EXPECT_TRUE(hasText(f.hwnd(), L"自动更换冲突的代理端口"));
+    EXPECT_FALSE(hasText(f.hwnd(), L"内核运行中，代理端口未就绪"));
+}
+
+APS_TEST(mainwindow, generic_outlet_activates_only_on_its_own_successful_click) {
+    WindowFixture f;
+    f.window->onPipeState(true);
+    f.window->onPipeMessage(R"({"type":"STATS","kernels":[{"id":"auto-plain","name":"plain.exe","alive":true,"seen":true,"has_api":false,"socks_port":19101}],"outlets":[]})");
+    const auto button = findText(f.hwnd(), L"连接 SOCKS5");
+    EXPECT_TRUE(button != nullptr);
+    if (!button) return;
+    EXPECT_EQ(SendMessageW(button, BM_GETCHECK, 0, 0), BST_UNCHECKED);
+    SendMessageW(GetParent(button), WM_COMMAND, GetDlgCtrlID(button), reinterpret_cast<LPARAM>(button));
+    auto reply = [&](const std::string& request, bool ready) {
+        f.window->onPipeMessage("{\"type\":\"STATS\",\"outlets\":[{\"id\":\"auto-plain\",\"api\":false,\"alive\":true,"
+            "\"selection_ok\":false,\"socks_only_ready\":" + std::string(ready ? "true" : "false") +
+            ",\"test_request_id\":\"" + request + "\"}]}");
+    };
+    reply("another-request", true);
+    EXPECT_EQ(SendMessageW(button, BM_GETCHECK, 0, 0), BST_UNCHECKED);
+    reply(lastTestRequestId, false);
+    EXPECT_EQ(SendMessageW(button, BM_GETCHECK, 0, 0), BST_UNCHECKED);
+    SendMessageW(GetParent(button), WM_COMMAND, GetDlgCtrlID(button), reinterpret_cast<LPARAM>(button));
+    reply(lastTestRequestId, true);
+    EXPECT_EQ(SendMessageW(button, BM_GETCHECK, 0, 0), BST_CHECKED);
 }
 
 APS_TEST(mainwindow, node_metadata_and_pending_test_ignore_stale_success) {
